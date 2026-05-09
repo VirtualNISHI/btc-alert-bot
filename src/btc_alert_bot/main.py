@@ -26,6 +26,7 @@ from .detector import (
     save_state,
 )
 from .features import compute_market_features
+from .history import record_alert
 from .market import fetch_market_snapshot
 from .price import fetch_btc_price
 from .publishers import post_discord, post_x
@@ -40,6 +41,7 @@ logging.basicConfig(
 log = logging.getLogger("btc_alert_bot")
 
 STATE_PATH = Path("data/state.json")
+HISTORY_DB_PATH = Path("data/history.sqlite")
 
 
 def main() -> int:
@@ -120,24 +122,40 @@ def main() -> int:
     except Exception as e:
         log.warning("Chart render failed: %s — posting text only", e)
 
-    # 9. Publish (or dry-run preview).
+    # 9. Publish (or dry-run preview). Track per-channel for the history DB.
     dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
     enable_x = os.getenv("ENABLE_X_POST", "false").lower() == "true"
-    delivered = False
+    delivered_discord = False
+    delivered_x = False
     if dry_run:
         log.info("[DRY_RUN] Skipping actual posts")
-        delivered = True
+        delivered_discord = True  # treat dry-run as success for cooldown
     else:
-        if post_discord(summary, price_data, spike, chart_png=chart_png):
-            delivered = True
+        delivered_discord = post_discord(
+            summary, price_data, spike, chart_png=chart_png
+        )
         if enable_x:
-            if post_x(summary, price_data, spike, chart_png=chart_png):
-                delivered = True
+            delivered_x = post_x(
+                summary, price_data, spike, chart_png=chart_png
+            )
         else:
             log.info("X posting disabled (set ENABLE_X_POST=true to enable)")
+    delivered = delivered_discord or delivered_x
 
-    # 10. Persist state — cooldown fields only updated if delivery succeeded,
-    #    but feature_history (already appended to `state`) is always saved.
+    # 10. Append to SQLite history DB regardless of delivery — even a failed
+    #     delivery is still a real spike worth auditing later.
+    record_alert(
+        HISTORY_DB_PATH,
+        price_data=price_data,
+        spike=spike,
+        factors=factors,
+        summary=summary,
+        delivered_discord=delivered_discord,
+        delivered_x=delivered_x,
+    )
+
+    # 11. Persist state.json — cooldown fields only updated if delivery
+    #     succeeded, but feature_history (already appended) is always saved.
     if delivered:
         state.update({
             "last_alert_time": price_data["timestamp"],
@@ -150,7 +168,8 @@ def main() -> int:
         save_state(STATE_PATH, state)
         log.info("Cooldown state + history persisted.")
     else:
-        # Still save history so the next run has data — but don't mark cooldown.
+        # Still save feature history so the next run has data — but don't
+        # mark cooldown so the next tick can retry the publish.
         save_state(STATE_PATH, state)
         log.warning(
             "All publishers failed — history saved, cooldown NOT updated."

@@ -11,15 +11,15 @@ __pycache__/
 venv/
 
 # Data / logs
-# state.json + macro_cache.json must be tracked so the GitHub Actions workflow
-# can persist them across runs (each runner is otherwise stateless).
-# Other data files stay ignored.
+# state.json, macro_cache.json, and history.sqlite must be tracked so the
+# GitHub Actions workflow can persist them across runs (each runner is
+# otherwise stateless). Other data files stay ignored.
 data/*
 !data/.gitkeep
 !data/state.json
 !data/macro_cache.json
+!data/history.sqlite
 *.log
-*.db
 
 # IDE
 .vscode/

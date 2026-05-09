@@ -43,13 +43,20 @@ jobs:
         run: python -m btc_alert_bot.main
 
       - name: Commit updated state (if any)
+        # Run even if the alert step failed: state.json / history.sqlite
+        # writes happen *before* the non-zero exit, and we want them
+        # persisted regardless of delivery success so the audit trail is
+        # complete and the next runner inherits the latest features.
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # state.json: changes every run (feature_history append).
           # macro_cache.json: changes ~every 4h (TTL).
-          if [ -n "$(git status --porcelain data/state.json data/macro_cache.json)" ]; then
-            git add data/state.json data/macro_cache.json 2>/dev/null || true
+          # history.sqlite: changes only when an alert fires.
+          TRACKED="data/state.json data/macro_cache.json data/history.sqlite"
+          if [ -n "$(git status --porcelain $TRACKED)" ]; then
+            git add $TRACKED 2>/dev/null || true
             git commit -m "chore: update alert state [skip ci]"
             git push
           else

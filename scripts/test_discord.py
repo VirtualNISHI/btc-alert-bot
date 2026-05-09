@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from btc_alert_bot.analyzers import gather_factors
 from btc_alert_bot.chart import render_chart
 from btc_alert_bot.features import compute_market_features
+from btc_alert_bot.history import record_alert
 from btc_alert_bot.market import fetch_market_snapshot
 from btc_alert_bot.price import fetch_btc_price
 from btc_alert_bot.publishers import post_discord
@@ -106,7 +107,19 @@ def main() -> int:
 
     # 6. Discord post (X skipped).
     log.info("Posting to Discord (X skipped to save quota)...")
-    post_discord(summary, price_data, spike, chart_png=chart_png)
+    delivered_discord = post_discord(summary, price_data, spike, chart_png=chart_png)
+
+    # 7. Record to history DB (the test_discord pipeline mirrors main.py).
+    alert_id = record_alert(
+        ROOT / "data" / "history.sqlite",
+        price_data=price_data,
+        spike=spike,
+        factors=factors,
+        summary=summary,
+        delivered_discord=delivered_discord,
+        delivered_x=False,
+    )
+    log.info("Recorded test alert: id=%s", alert_id)
 
     log.info("=== Test Complete ===")
     log.info("Check Discord channel for the alert message.")
