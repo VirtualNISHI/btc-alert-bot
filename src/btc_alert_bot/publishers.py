@@ -121,7 +121,9 @@ def post_discord(
 
     embed = {
         "title": f"🚨 BTC緊急価格変動速報 ({spike['change']:+.2f}% / {window})",
-        "description": summary,
+        # Leading blank line gives the title visual breathing room before
+        # the Gemini summary kicks in.
+        "description": f"\n{summary}",
         "color": color,
         "fields": fields,
         "footer": {"text": "Source: OKX (WS) + CoinGecko + RSS feeds"},
@@ -186,12 +188,14 @@ def post_x(
     hashtags = "#BTC #Bitcoin #暗号資産"
     # Twitter weights CJK chars at 2 each — `len()` would undercount and
     # let the API reject long Japanese summaries. Use weighted length.
+    # The format is: header + blank line + body + newline + hashtags
+    # (3 newlines total between sections).
     fixed_weight = (
-        x_weighted_length(header) + x_weighted_length(hashtags) + 2  # 2 newlines
+        x_weighted_length(header) + x_weighted_length(hashtags) + 3  # 3 newlines
     )
     body_budget = max(20, X_WEIGHTED_LIMIT - fixed_weight)
     body = x_truncate_to_weight(summary, body_budget)
-    text = f"{header}\n{body}\n{hashtags}"
+    text = f"{header}\n\n{body}\n{hashtags}"
 
     try:
         media_ids: list[int] | None = None
