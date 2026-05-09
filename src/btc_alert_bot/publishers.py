@@ -83,8 +83,8 @@ def post_discord(
 
 def post_x(
     summary: str,
-    price_data: dict,  # noqa: ARG001
-    spike: dict,  # noqa: ARG001
+    price_data: dict,  # noqa: ARG001 — present for parity with post_discord
+    spike: dict,
     chart_png: bytes | None = None,
 ) -> bool:
     """Post a tweet, optionally with the chart PNG attached. Returns success.
@@ -103,9 +103,17 @@ def post_x(
         log.warning("X API keys incomplete — skipping X post")
         return False
 
-    text = summary
-    if len(text) > 270:
-        text = text[:267] + "..."
+    # Build tweet text: header line + summary + hashtags.
+    arrow = "📈" if spike["direction"] == "up" else "📉"
+    header = f"{arrow} BTC {spike['change']:+.2f}% / {spike['window']}"
+    hashtags = "#BTC #Bitcoin #暗号資産"
+    # Twitter's hard limit is 280 chars; we leave a small margin for
+    # newlines + hashtags. Truncate the summary if needed.
+    max_summary = 280 - len(header) - len(hashtags) - 4  # 4 for newlines
+    body = summary
+    if len(body) > max_summary:
+        body = body[: max_summary - 1] + "…"
+    text = f"{header}\n{body}\n{hashtags}"
 
     try:
         media_ids: list[int] | None = None

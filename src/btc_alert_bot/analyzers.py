@@ -1,22 +1,28 @@
-"""Parallel factor analysis: news, derivatives, macro events.
+"""Parallel factor analysis: news, derivatives, macro events, social.
 
-All sources are free / unauthenticated. Each fetcher is wrapped in
-broad try/except so a single source failing does not break the alert.
+All sources are free / unauthenticated (a couple require a free API key
+that's opt-in via env var). Each fetcher is wrapped in broad try/except
+so a single source failing does not break the alert.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import re
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
 
 from .deribit import fetch_options_factor
+from .derivatives import fetch_derivatives_context
 from .fred import fetch_macro_background
 from .x_monitor import fetch_x_monitor
 
@@ -44,6 +50,32 @@ EXCHANGE_ANNOUNCEMENT_FEEDS = [
 EXCHANGE_LOOKBACK_MIN = 180
 
 BYBIT_FUNDING_URL = "https://api.bybit.com/v5/market/funding/history"
+
+# Aggregator news (Google News RSS): single endpoint, 500+ underlying outlets.
+# Useful as a recall-boost layer — duplicates with the dedicated feeds are
+# resolved by the dedup step downstream.
+GOOGLE_NEWS_RSS = (
+    "https://news.google.com/rss/search?"
+    "q=bitcoin+OR+BTC+when:6h&hl=en-US&gl=US&ceid=US:en"
+)
+
+# Reddit RSS — early signal for community-known events (rumors before media).
+# Reddit requires a unique User-Agent. /new/ is chronological so we always
+# pick the freshest items, then filter by keyword/title.
+REDDIT_FEEDS = [
+    ("r/Bitcoin", "https://www.reddit.com/r/Bitcoin/new/.rss"),
+    ("r/CryptoMarkets", "https://www.reddit.com/r/CryptoMarkets/new/.rss"),
+]
+REDDIT_USER_AGENT = "btc-alert-bot/0.2 (+https://github.com/VirtualNISHI/btc-alert-bot)"
+REDDIT_LOOKBACK_MIN = 60
+REDDIT_TIMEOUT = 8
+
+# CryptoPanic aggregates ~50 crypto news outlets. Free tier requires a token
+# (free signup at https://cryptopanic.com/developers/api/). When unset, the
+# fetcher silently returns []. Refresh cadence on the free tier is ~5min.
+CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
+CRYPTOPANIC_LOOKBACK_MIN = 60
+CRYPTOPANIC_TIMEOUT = 8
 
 # Look back this many minutes when scanning RSS for relevant items.
 NEWS_LOOKBACK_MIN = 90
@@ -292,30 +324,42 @@ def fetch_macro() -> list[dict]:
     return items
 
 
-def gather_factors(spike: dict) -> list[dict]:  # noqa: ARG001 (spike reserved for future scoring)
-    """Run all analyzers in parallel and return ranked candidate factors.
+def gather_factors(spike: dict | None = None) -> list[dict]:
+    """Run all analyzers in parallel, dedupe, score, and return top factors.
 
     A hard deadline (GATHER_FACTORS_DEADLINE_S) bounds total wall time —
-    any analyzer that misses the deadline is dropped from this alert and
-    will be retried on the next cron tick.
+    any analyzer that misses the deadline is dropped from this alert.
+
+    The result is ranked by ``rank_factors()``, which combines source
+    credibility, recency, keyword strength, direction match, and
+    cross-source corroboration. Items are deduplicated first so the
+    Gemini summarizer doesn't mistake aggregator copies for independent
+    confirmations.
     """
     fetchers = [
+        # Primary news + aggregators
         fetch_news,
+        fetch_google_news,
+        fetch_cryptopanic,
+        # Exchange + macro-event triggers
         fetch_exchange_announcements,
-        fetch_derivatives,
         fetch_macro,
-        fetch_options_factor,    # Deribit IV / term structure / skew / RV
-        fetch_macro_background,  # FRED daily DXY/yields/VIX/FedFunds
-        fetch_x_monitor,         # Nitter RSS for high-signal X accounts
+        # Market microstructure (amplifiers)
+        fetch_derivatives_context,
+        fetch_options_factor,
+        # Macro / social context
+        fetch_macro_background,
+        fetch_reddit_signal,
+        fetch_x_monitor,
     ]
-    results: list[dict] = []
+    raw: list[dict] = []
     with ThreadPoolExecutor(max_workers=len(fetchers)) as ex:
         futures = {ex.submit(f): f.__name__ for f in fetchers}
         try:
             for fut in as_completed(futures, timeout=GATHER_FACTORS_DEADLINE_S):
                 name = futures[fut]
                 try:
-                    results.extend(fut.result())
+                    raw.extend(fut.result())
                 except Exception as e:
                     log.warning("Analyzer %s crashed: %s", name, e)
         except TimeoutError:
@@ -327,26 +371,417 @@ def gather_factors(spike: dict) -> list[dict]:  # noqa: ARG001 (spike reserved f
             for f in futures:
                 f.cancel()
 
-    # Priority order: imminent confirmed events > X (high-signal accounts
-    # often beat media on breaking news) > exchange announcements >
-    # general media > spot derivatives > options positioning > FRED daily
-    # background.
-    type_priority = {
-        "macro": 0,
-        "x_monitor": 1,
-        "exchange": 2,
-        "news": 3,
-        "derivatives": 4,
-        "options": 5,
-        "macro_background": 6,
-    }
-    results.sort(key=lambda x: type_priority.get(x["type"], 9))
-    return results[:10]
+    deduped, dup_groups = _deduplicate_factors(raw)
+    return rank_factors(deduped, spike, dup_groups, top_k=10)
+
+
+# ---------------------------------------------------------------------------
+# Deduplication: collapse aggregator copies of the same story
+# ---------------------------------------------------------------------------
+
+# Stop-words ignored when fingerprinting titles for similarity.
+_TITLE_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on",
+    "at", "by", "for", "and", "or", "but", "as", "with", "after", "amid",
+    "btc", "bitcoin", "crypto", "says", "report", "amid", "while",
+}
+
+
+def _normalize_url(url: str) -> str:
+    """Strip query strings + fragments + trailing slashes for dedup."""
+    if not url:
+        return ""
+    try:
+        p = urlparse(url)
+        # Drop tracking params like ?utm_source=...; keep only path identity.
+        return urlunparse((p.scheme, p.netloc.lower(), p.path.rstrip("/"), "", "", ""))
+    except Exception:
+        return url
+
+
+def _title_fingerprint(title: str) -> str:
+    """Coarse fingerprint of a headline: lowercase, alphanum, no stopwords.
+
+    Two titles with the same fingerprint are extremely likely to be the
+    same story published by different outlets (e.g. Reuters → CoinDesk,
+    Reuters → CryptoPanic, Reuters → Google News).
+    """
+    if not title:
+        return ""
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    significant = [w for w in words if w not in _TITLE_STOPWORDS and len(w) > 2]
+    # Truncate to first ~10 significant tokens — enough for identity, not so
+    # narrow that minor edits break the match.
+    key = "-".join(significant[:10])
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:16] if key else ""
+
+
+def _deduplicate_factors(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    """Collapse near-duplicate news items.
+
+    Returns ``(unique_items, dup_count_by_key)``. The dup count is fed to
+    the ranker so we can *reward* corroborated stories without inflating
+    the prompt with copies. Per dup group we keep the earliest-published
+    item (more credit to the original source).
+    """
+    by_key: dict[str, dict] = {}
+    counts: dict[str, int] = {}
+    for it in items:
+        # Non-text factors (derivatives / options / macro_background) get
+        # unique synthetic keys so they're never deduped against each other.
+        if it.get("type", "").startswith(("derivatives", "options", "macro_background")):
+            key = f"struct:{it.get('type')}:{it.get('source')}"
+            by_key.setdefault(key, it)
+            continue
+
+        # For news/social items, title fingerprint is a better cross-source
+        # identity than URL — the same headline appears at different URLs
+        # when it's syndicated through aggregators (Google News etc.).
+        title_key = _title_fingerprint(it.get("title", ""))
+        url_key = _normalize_url(it.get("url", ""))
+        key = title_key or url_key
+        if not key:
+            # Last resort: random-ish key so we never silently drop a unique item.
+            key = f"raw:{id(it)}"
+
+        counts[key] = counts.get(key, 0) + 1
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = it
+            continue
+        # Keep the earliest-published copy. Prefer dedicated-feed items
+        # over aggregator items when timestamps tie (originals over copies).
+        existing_pub = existing.get("published") or ""
+        cur_pub = it.get("published") or ""
+        if cur_pub < existing_pub:
+            by_key[key] = it
+        elif cur_pub == existing_pub and not existing.get("type", "").startswith("news_aggregator"):
+            # Existing is already a dedicated feed; keep it.
+            pass
+        elif cur_pub == existing_pub and not it.get("type", "").startswith("news_aggregator"):
+            # Replace aggregator copy with dedicated feed copy.
+            by_key[key] = it
+    return list(by_key.values()), counts
+
+
+# ---------------------------------------------------------------------------
+# Ranking: source × recency × keyword × direction × corroboration
+# ---------------------------------------------------------------------------
+
+# Source credibility weights (higher = more authoritative for a market move).
+_SOURCE_WEIGHTS = {
+    "macro": 40,                 # imminent confirmed govt/macro release
+    "exchange": 38,              # listing / hack / halt is binary truth
+    "derivatives_liq": 30,       # observed cascade
+    "derivatives_pos": 22,
+    "derivatives_fund": 18,
+    "news": 26,                  # dedicated crypto media
+    "news_aggregator": 20,       # Google News / CryptoPanic
+    "options": 16,               # Deribit IV/skew = backdrop
+    "macro_background": 12,      # FRED daily = backdrop
+    "social_reddit": 10,
+    "x_monitor": 14,
+    "derivatives": 18,           # legacy bucket
+}
+
+_BULL_KEYWORDS = (
+    "etf", "approval", "approve", "ruling", "win", "rally", "soar",
+    "surge", "buy", "accumulate", "treasury buys", "spot etf",
+    "short squeeze", "short liquidation",
+)
+_BEAR_KEYWORDS = (
+    "hack", "exploit", "outage", "halt", "delist", "ban", "lawsuit",
+    "indict", "fraud", "investigation", "crash", "dump", "sell-off",
+    "selloff", "long liquidation", "depeg", "bankrupt", "outflow",
+    "sec sue", "sec charge",
+)
+_HIGH_SIGNAL_KEYWORDS = (
+    "fomc", "fed", "powell", "cpi", "ppi", "nfp", "jobs", "treasury",
+    "etf", "sec", "binance", "coinbase", "tether", "usdt", "usdc",
+    "regulation", "stablecoin", "halving", "fork",
+)
+
+
+def _classify_keywords(title: str) -> tuple[int, str | None]:
+    """Return (keyword_weight, direction_hint)."""
+    t = (title or "").lower()
+    weight = 0
+    if any(k in t for k in _HIGH_SIGNAL_KEYWORDS):
+        weight += 18
+    direction: str | None = None
+    if any(k in t for k in _BULL_KEYWORDS):
+        weight += 12
+        direction = "up"
+    if any(k in t for k in _BEAR_KEYWORDS):
+        weight += 12
+        # If both directions trigger, leave hint None — ambiguous.
+        direction = None if direction else "down"
+    return weight, direction
+
+
+def _recency_weight(published: str | None, now: datetime) -> int:
+    if not published:
+        return 0
+    try:
+        ts = datetime.fromisoformat(published)
+    except Exception:
+        return 0
+    # Some sources publish naive timestamps; assume UTC.
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    elapsed_min = (now - ts).total_seconds() / 60
+    if elapsed_min < 0:
+        return 5  # future events (e.g. macro calendar) — small bonus
+    if elapsed_min <= 10:
+        return 30
+    if elapsed_min <= 30:
+        return 22
+    if elapsed_min <= 60:
+        return 14
+    if elapsed_min <= 180:
+        return 6
+    return -10  # actively penalize stale items
+
+
+def _score_factor(
+    factor: dict,
+    spike: dict | None,
+    corroboration: int,
+    now: datetime,
+) -> int:
+    score = _SOURCE_WEIGHTS.get(factor.get("type", ""), 5)
+    score += _recency_weight(factor.get("published"), now)
+    kw_weight, kw_direction = _classify_keywords(factor.get("title", ""))
+    score += kw_weight
+
+    # Direction match — does this factor point the same way as the spike?
+    spike_dir = (spike or {}).get("direction") if spike else None
+    factor_dir = factor.get("direction_hint") or kw_direction
+    if spike_dir and factor_dir:
+        if factor_dir == spike_dir:
+            score += 15
+        else:
+            score -= 8  # mismatched direction is suspicious
+
+    # Corroboration bonus: this story showed up in multiple aggregators.
+    if corroboration >= 3:
+        score += 25
+    elif corroboration == 2:
+        score += 12
+
+    # Magnitude bonus for liquidations (USD scale).
+    mag = factor.get("magnitude_usd") or 0
+    if mag >= 50_000_000:
+        score += 25
+    elif mag >= 10_000_000:
+        score += 12
+    elif mag >= 1_000_000:
+        score += 4
+
+    return score
+
+
+def rank_factors(
+    factors: list[dict],
+    spike: dict | None,
+    corroboration: dict[str, int],
+    *,
+    top_k: int = 10,
+) -> list[dict]:
+    """Score every factor, sort desc, return the top_k.
+
+    Mutates each factor in-place to add ``_score`` and ``_corroboration``
+    so the summarizer can show them in the prompt for transparency.
+    """
+    now = datetime.now(timezone.utc)
+    scored: list[tuple[int, dict]] = []
+    for f in factors:
+        # Recompute the same key the dedup step used so corroboration
+        # lookups actually hit. Order matters: title fingerprint first
+        # (cross-aggregator identity), URL second.
+        ftype = f.get("type", "")
+        if ftype.startswith(("derivatives", "options", "macro_background")):
+            key = f"struct:{ftype}:{f.get('source')}"
+        else:
+            title_key = _title_fingerprint(f.get("title", ""))
+            url_key = _normalize_url(f.get("url", ""))
+            key = title_key or url_key or f"raw:{id(f)}"
+        corr = corroboration.get(key, 1)
+        s = _score_factor(f, spike, corr, now)
+        f["_score"] = s
+        f["_corroboration"] = corr
+        scored.append((s, f))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [f for _, f in scored[:top_k]]
 
 
 def _is_btc_relevant(title: str) -> bool:
     t = title.lower()
     return any(k in t for k in ("bitcoin", "btc", "crypto", "etf"))
+
+
+# ---------------------------------------------------------------------------
+# Google News RSS (aggregator) — recall layer
+# ---------------------------------------------------------------------------
+
+def fetch_google_news() -> list[dict]:
+    """BTC keyword search on Google News RSS — 500+ outlets aggregated.
+
+    Latency: ~5 min behind original publish, but coverage is far wider
+    than the dedicated CoinDesk/Block/CoinTelegraph trio. The dedup step
+    downstream collapses duplicates with the same story.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=NEWS_LOOKBACK_MIN)
+    items: list[dict] = []
+    try:
+        feed = feedparser.parse(GOOGLE_NEWS_RSS)
+        for entry in feed.entries[:25]:
+            try:
+                pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if pub_dt < cutoff:
+                continue
+            title = entry.get("title", "")
+            if not _is_btc_relevant(title):
+                continue
+            # Google News titles look like "Headline - Outlet Name". Split
+            # the outlet off so the dedup fingerprint matches dedicated
+            # feeds (e.g. CoinDesk RSS produces the same headline minus
+            # the suffix).
+            outlet = "Google News"
+            clean_title = title
+            if " - " in title:
+                head, _, tail = title.rpartition(" - ")
+                outlet = tail.strip() or outlet
+                clean_title = head.strip() or title
+            items.append({
+                "type": "news_aggregator",
+                "source": f"GoogleNews/{outlet}",
+                "title": clean_title,
+                "url": entry.get("link", ""),
+                "published": pub_dt.isoformat(),
+                "summary": entry.get("summary", "")[:300],
+            })
+    except Exception as e:
+        log.warning("Google News fetch failed: %s", e)
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Reddit RSS — community early signal
+# ---------------------------------------------------------------------------
+
+def fetch_reddit_signal() -> list[dict]:
+    """Recent /r/Bitcoin and /r/CryptoMarkets posts.
+
+    High-noise but sometimes catches rumors / outages before the media
+    picks them up. Filter aggressively on title keywords so we don't
+    flood the prompt with shitposts.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=REDDIT_LOOKBACK_MIN)
+    items: list[dict] = []
+    headers = {"User-Agent": REDDIT_USER_AGENT}
+    for subreddit, url in REDDIT_FEEDS:
+        try:
+            resp = requests.get(url, headers=headers, timeout=REDDIT_TIMEOUT)
+            if resp.status_code != 200:
+                log.warning("Reddit %s HTTP %d", subreddit, resp.status_code)
+                continue
+            feed = feedparser.parse(resp.text)
+            for entry in feed.entries[:25]:
+                try:
+                    pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if pub_dt < cutoff:
+                    continue
+                title = entry.get("title", "")
+                if not _is_reddit_signal(title):
+                    continue
+                items.append({
+                    "type": "social_reddit",
+                    "source": subreddit,
+                    "title": title[:200],
+                    "url": entry.get("link", ""),
+                    "published": pub_dt.isoformat(),
+                })
+        except Exception as e:
+            log.warning("Reddit fetch failed (%s): %s", subreddit, e)
+    return items
+
+
+def _is_reddit_signal(title: str) -> bool:
+    """Aggressive filter so /r/Bitcoin's daily memes don't drown the prompt."""
+    t = (title or "").lower()
+    # Strong signal keywords — events that actually move price.
+    strong = (
+        "hack", "exploit", "outage", "halt", "suspend", "delist", "list",
+        "etf", "approval", "rejection", "sec", "fed", "fomc", "cpi", "ppi",
+        "powell", "treasury", "lawsuit", "indict", "ban", "regulation",
+        "liquidation", "whale", "dump", "pump", "rally", "crash", "flash",
+        "binance", "coinbase", "bybit", "tether", "usdt", "usdc", "stable",
+        "bitcoin", "btc",
+    )
+    return any(k in t for k in strong)
+
+
+# ---------------------------------------------------------------------------
+# CryptoPanic API — multi-outlet aggregator (opt-in)
+# ---------------------------------------------------------------------------
+
+def fetch_cryptopanic() -> list[dict]:
+    """CryptoPanic posts API (~50 outlet aggregator).
+
+    Free tier requires a token from https://cryptopanic.com/developers/api/
+    If CRYPTOPANIC_AUTH_TOKEN is unset, returns [] silently.
+    Refresh cadence on free tier is ~5min, so we don't poll faster than that.
+    """
+    token = os.getenv("CRYPTOPANIC_AUTH_TOKEN")
+    if not token:
+        return []
+    try:
+        resp = requests.get(
+            CRYPTOPANIC_URL,
+            params={
+                "auth_token": token,
+                "currencies": "BTC",
+                "filter": "important",  # surface market-moving items first
+                "kind": "news",
+            },
+            timeout=CRYPTOPANIC_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            log.warning("CryptoPanic HTTP %d", resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as e:
+        log.warning("CryptoPanic fetch failed: %s", e)
+        return []
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=CRYPTOPANIC_LOOKBACK_MIN)
+    items: list[dict] = []
+    for r in data.get("results", []) or []:
+        published_str = r.get("published_at") or r.get("created_at")
+        try:
+            pub_dt = datetime.fromisoformat(
+                (published_str or "").replace("Z", "+00:00")
+            )
+        except Exception:
+            continue
+        if pub_dt < cutoff:
+            continue
+        outlet = (r.get("source") or {}).get("title", "CryptoPanic")
+        items.append({
+            "type": "news_aggregator",
+            "source": f"CryptoPanic/{outlet}",
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "published": pub_dt.isoformat(),
+            # CryptoPanic flags: 'important', 'positive', 'negative', etc.
+            "tags": list((r.get("kind"),) + tuple(r.get("votes", {}).keys())),
+        })
+    return items
 
 
 def _is_exchange_relevant(title: str) -> bool:

@@ -20,6 +20,7 @@ data/*
 !data/macro_cache.json
 !data/fred_cache.json
 !data/history.sqlite
+!data/x_monitor_circuit.json
 *.log
 
 # IDE

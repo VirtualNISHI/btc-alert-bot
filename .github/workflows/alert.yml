@@ -63,7 +63,7 @@ jobs:
           # (e.g. fred_cache.json with no FRED key) doesn't fail `git add`
           # and accidentally skip the rest of the state commit.
           EXISTING=""
-          for f in data/state.json data/macro_cache.json data/fred_cache.json data/history.sqlite; do
+          for f in data/state.json data/macro_cache.json data/fred_cache.json data/history.sqlite data/x_monitor_circuit.json; do
             [ -f "$f" ] && EXISTING="$EXISTING $f"
           done
           if [ -n "$EXISTING" ] && [ -n "$(git status --porcelain $EXISTING)" ]; then
