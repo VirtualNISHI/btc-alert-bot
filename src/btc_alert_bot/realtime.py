@@ -25,7 +25,12 @@ import logging
 import os
 import signal
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 import websockets
 from dotenv import load_dotenv
@@ -57,6 +62,12 @@ log = logging.getLogger("btc_alert_bot.realtime")
 # /business for candles + trades. We need candle5m → /business.
 OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/business"
 INST_ID = "BTC-USDT-SWAP"
+
+# 1m fast-track: when an intra-minute |close-open|/open exceeds this, we
+# bypass composite scoring and fire an alert immediately. The existing
+# cooldown still applies, so 5 consecutive big-1m bars only produce one
+# alert. Tuned at 0.5% — typical 1m ATR is ~0.05%, so 0.5% is ~10× ATR.
+FAST_TRACK_RETURN_1M_PCT = float(os.getenv("FAST_TRACK_RETURN_1M_PCT", "0.5"))
 
 STATE_PATH = Path("data/state.json")
 HISTORY_DB_PATH = Path("data/history.sqlite")
@@ -115,6 +126,7 @@ class RealtimeBot:
                             "op": "subscribe",
                             "args": [
                                 {"channel": "candle5m", "instId": INST_ID},
+                                {"channel": "candle1m", "instId": INST_ID},
                             ],
                         }))
                         await self._listen(ws)
@@ -195,7 +207,8 @@ class RealtimeBot:
             return
 
         arg = data.get("arg") or {}
-        if arg.get("channel") != "candle5m":
+        channel = arg.get("channel")
+        if channel not in ("candle5m", "candle1m"):
             return
         rows = data.get("data") or []
         if not rows:
@@ -205,17 +218,38 @@ class RealtimeBot:
         if not confirmed:
             return  # mid-bar update — wait for the close
 
-        log.info("5m candle closed: ts=%s close=%s", latest[0], latest[4])
-        # Fire-and-forget so the WS loop keeps receiving frames and
-        # sending keepalives even while detection is in flight. If a
-        # previous detection is still running, skip this candle — the
-        # next close gets fresh state anyway.
+        # Single in-flight detection — same backpressure rule for both
+        # channels so we never have two pipelines running at once.
         if self._detection_task and not self._detection_task.done():
             log.warning(
-                "Previous detection still running; skipping this candle"
+                "Previous detection still running; skipping this %s candle",
+                channel,
             )
             return
-        self._detection_task = asyncio.create_task(self._run_detection_async())
+
+        if channel == "candle5m":
+            log.info("5m candle closed: ts=%s close=%s", latest[0], latest[4])
+            self._detection_task = asyncio.create_task(self._run_detection_async())
+            return
+
+        # 1m fast-track: alert directly on huge intra-minute moves only.
+        try:
+            open_p = float(latest[1])
+            close_p = float(latest[4])
+        except (ValueError, TypeError):
+            return
+        if open_p <= 0:
+            return
+        intra_pct = (close_p - open_p) / open_p * 100.0
+        if abs(intra_pct) < FAST_TRACK_RETURN_1M_PCT:
+            return  # quiet 1m bar, ignore
+        log.info(
+            "1m FAST-TRACK fired: open=%.2f close=%.2f intra=%+.3f%%",
+            open_p, close_p, intra_pct,
+        )
+        self._detection_task = asyncio.create_task(
+            self._run_fast_track_async(intra_pct, close_p)
+        )
 
     # ------------------------------------------------------------------
     # Detection pipeline (mirrors main.py, sync)
@@ -235,6 +269,115 @@ class RealtimeBot:
             )
         except Exception:
             log.exception("Detection task crashed unexpectedly")
+
+    async def _run_fast_track_async(self, intra_pct: float, close_p: float) -> None:
+        """Async wrapper around the 1m fast-track pipeline."""
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._run_fast_track, intra_pct, close_p),
+                timeout=DETECTION_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.error(
+                "Fast-track exceeded %.0fs deadline; will rely on 5m close",
+                DETECTION_TIMEOUT_S,
+            )
+        except Exception:
+            log.exception("Fast-track task crashed unexpectedly")
+
+    def _run_fast_track(self, intra_pct: float, close_p: float) -> None:
+        """1m fast-track alert pipeline.
+
+        Bypasses composite scoring — by definition the move was already
+        large enough to be alert-worthy. Still respects the existing
+        directional cooldown so we don't spam if several consecutive 1m
+        bars are big.
+        """
+        try:
+            direction = "up" if intra_pct >= 0 else "down"
+            state = load_state(STATE_PATH)
+
+            # Reuse the detector's directional cooldown: build a temporary
+            # detector instance and let it tell us if we're suppressed.
+            detector = SpikeDetector(state)
+            last_dir = detector._cooldown_direction(  # noqa: SLF001
+                _now_iso()
+            )
+            if detector._suppressed_by_cooldown(last_dir, direction):  # noqa: SLF001
+                log.info("Fast-track suppressed by cooldown")
+                return
+
+            spike = {
+                "window": "1m",
+                "change": intra_pct,
+                "direction": direction,
+                "score": None,  # composite scoring intentionally bypassed
+                "reasons": [
+                    f"1m intra-bar move {intra_pct:+.3f}% (fast-track)",
+                    f"close: ${close_p:,.2f}",
+                    f"threshold: ±{FAST_TRACK_RETURN_1M_PCT:.2f}%",
+                ],
+                "features": None,
+            }
+            log.info(
+                "FAST-TRACK SPIKE: 1m %+.3f%% (%s)", intra_pct, direction
+            )
+
+            price_data = fetch_btc_price()
+            log.info(
+                "BTC $%.2f | 1h %+.2f%% | 24h %+.2f%%",
+                price_data["price_usd"],
+                price_data["change_1h"],
+                price_data["change_24h"],
+            )
+
+            factors = gather_factors(spike)
+            similar = find_similar_alerts(HISTORY_DB_PATH, spike, limit=3)
+            summary = summarize(price_data, spike, factors, similar_alerts=similar)
+
+            chart_png: bytes | None = None
+            try:
+                chart_png = render_chart(spike, price_data)
+            except Exception as e:
+                log.warning("Chart render failed: %s", e)
+
+            dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+            enable_x = os.getenv("ENABLE_X_POST", "false").lower() == "true"
+            d_disc = d_x = False
+            if dry_run:
+                log.info("[DRY_RUN] Skipping actual posts")
+                d_disc = True
+            else:
+                d_disc = post_discord(
+                    summary, price_data, spike, chart_png=chart_png
+                )
+                if enable_x:
+                    d_x = post_x(
+                        summary, price_data, spike, chart_png=chart_png
+                    )
+
+            record_alert(
+                HISTORY_DB_PATH,
+                price_data=price_data,
+                spike=spike,
+                factors=factors,
+                summary=summary,
+                delivered_discord=d_disc,
+                delivered_x=d_x,
+            )
+
+            if d_disc or d_x:
+                state.update({
+                    "last_alert_time": price_data["timestamp"],
+                    "last_alert_price": price_data["price_usd"],
+                    "last_alert_direction": direction,
+                    "last_spike_window": "1m",
+                    "last_spike_change": intra_pct,
+                    "last_spike_score": None,
+                })
+            save_state(STATE_PATH, state)
+        except Exception:
+            log.exception("Fast-track pipeline failed")
 
     def _run_detection(self) -> None:
         try:
