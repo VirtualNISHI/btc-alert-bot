@@ -8,6 +8,7 @@ WORKDIR /app
 # Strip them after install to keep the final image small.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc g++ \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./

@@ -25,6 +25,14 @@ import pandas as pd  # noqa: E402
 
 from .market import fetch_klines  # noqa: E402
 
+# Ensure CJK glyphs (e.g. "仮想NISHI" in the credit footer) render instead
+# of falling back to tofu boxes. Noto Sans CJK ships in the Docker image
+# (fonts-noto-cjk) and is also commonly available locally on macOS/Linux.
+plt.rcParams["font.family"] = [
+    "Noto Sans CJK JP", "DejaVu Sans", "sans-serif",
+]
+plt.rcParams["axes.unicode_minus"] = False
+
 log = logging.getLogger(__name__)
 
 # (OKX bar code, num candles) per spike window.
