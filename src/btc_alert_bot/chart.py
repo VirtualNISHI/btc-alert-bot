@@ -15,10 +15,13 @@ from __future__ import annotations
 import io
 import logging
 
+import os.path
+
 import matplotlib
 
 matplotlib.use("Agg")  # Headless backend — required in CI.
 
+import matplotlib.font_manager as _fm  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import mplfinance as mpf  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -26,10 +29,25 @@ import pandas as pd  # noqa: E402
 from .market import fetch_klines  # noqa: E402
 
 # Ensure CJK glyphs (e.g. "仮想NISHI" in the credit footer) render instead
-# of falling back to tofu boxes. Noto Sans CJK ships in the Docker image
-# (fonts-noto-cjk) and is also commonly available locally on macOS/Linux.
+# of falling back to tofu boxes. We explicitly addfont() the file rather
+# than relying on matplotlib's auto-scan, because the font cache is built
+# during Docker build BEFORE fonts-noto-cjk lands and never refreshes.
+_CJK_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  # Linux (Debian/Ubuntu)
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/Library/Fonts/Hiragino Sans W3.ttc",                      # macOS
+    "C:/Windows/Fonts/YuGothR.ttc",                              # Windows
+]
+for _candidate in _CJK_FONT_CANDIDATES:
+    if os.path.exists(_candidate):
+        try:
+            _fm.fontManager.addfont(_candidate)
+        except Exception:
+            pass
+
 plt.rcParams["font.family"] = [
-    "Noto Sans CJK JP", "DejaVu Sans", "sans-serif",
+    "Noto Sans CJK JP", "Hiragino Sans", "Yu Gothic",
+    "DejaVu Sans", "sans-serif",
 ]
 plt.rcParams["axes.unicode_minus"] = False
 
