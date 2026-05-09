@@ -27,7 +27,7 @@ from btc_alert_bot.features import compute_market_features
 from btc_alert_bot.history import find_similar_alerts, record_alert
 from btc_alert_bot.market import fetch_market_snapshot
 from btc_alert_bot.price import fetch_btc_price
-from btc_alert_bot.publishers import post_discord
+from btc_alert_bot.publishers import post_discord, post_x
 from btc_alert_bot.summarizer import summarize
 
 load_dotenv()
@@ -113,9 +113,18 @@ def main() -> int:
         log.warning("Chart render failed: %s — text only", e)
         chart_png = None
 
-    # 6. Discord post (X skipped).
-    log.info("Posting to Discord (X skipped to save quota)...")
+    # 6. Discord post.
+    log.info("Posting to Discord...")
     delivered_discord = post_discord(summary, price_data, spike, chart_png=chart_png)
+
+    # 6b. X post — only if ENABLE_X_POST=true (so a stray local run doesn't
+    #     accidentally consume quota / publish a fake spike to followers).
+    delivered_x = False
+    if os.getenv("ENABLE_X_POST", "false").lower() == "true":
+        log.info("Posting to X (ENABLE_X_POST=true)...")
+        delivered_x = post_x(summary, price_data, spike, chart_png=chart_png)
+    else:
+        log.info("X posting disabled (set ENABLE_X_POST=true to verify)")
 
     # 7. Record to history DB (the test_discord pipeline mirrors main.py).
     alert_id = record_alert(
@@ -125,7 +134,7 @@ def main() -> int:
         factors=factors,
         summary=summary,
         delivered_discord=delivered_discord,
-        delivered_x=False,
+        delivered_x=delivered_x,
     )
     log.info("Recorded test alert: id=%s", alert_id)
 
