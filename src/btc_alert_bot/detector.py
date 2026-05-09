@@ -82,10 +82,20 @@ def save_state(path: Path, state: dict) -> None:
 
 
 def append_feature_history(state: dict, features: dict) -> None:
-    """Append the latest features to the ring buffer in state."""
+    """Append the latest features to the ring buffer in state.
+
+    Deduplicates by ``ts`` against the most recent entry: in WS realtime
+    mode a reconnect causes OKX to re-send the most recent closed candle,
+    which would otherwise inflate the ring buffer with duplicates and
+    skew z-score statistics.
+    """
     if not features:
         return
     hist = state.setdefault("feature_history", [])
+    new_ts = features.get("ts")
+    if new_ts and hist and hist[-1].get("ts") == new_ts:
+        # Same candle as last time — silently skip.
+        return
     hist.append(features)
     # Trim to max size (FIFO).
     if len(hist) > FEATURE_HISTORY_MAX:

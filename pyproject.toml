@@ -16,6 +16,7 @@ dependencies = [
     "matplotlib>=3.8",
     "mplfinance>=0.12.10b0",
     "pandas>=2.0",
+    "websockets>=12",  # used by realtime.py (Phase 3)
 ]
 
 [tool.setuptools.packages.find]

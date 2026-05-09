@@ -37,6 +37,7 @@ jobs:
           X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          NITTER_ACCOUNTS: ${{ secrets.NITTER_ACCOUNTS }}
           LOG_LEVEL: INFO
           DRY_RUN: "false"
           # Discord 専用運用中。X 投稿を再開するときに true へ。

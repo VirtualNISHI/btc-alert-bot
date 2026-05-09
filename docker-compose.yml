@@ -1,0 +1,30 @@
+# Phase 3: WebSocket realtime mode for Oracle Cloud Always Free (or any
+# always-on host). State persists under ./data via a bind mount so a
+# `docker compose down/up` cycle preserves cooldown + history.
+
+services:
+  bot:
+    build: .
+    image: btc-alert-bot:latest
+    container_name: btc-alert-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    # Constrain resources so we stay well within the Always Free 24GB cap.
+    mem_limit: 512m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      # Simple liveness check: process must be alive AND state.json updated
+      # within the last 30min (otherwise the WS likely died).
+      test: ["CMD-SHELL", "test -f /app/data/state.json && [ $(($(date +%s) - $(stat -c %Y /app/data/state.json))) -lt 1800 ]"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
