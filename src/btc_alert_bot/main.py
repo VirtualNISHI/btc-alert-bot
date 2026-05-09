@@ -23,6 +23,7 @@ from .detector import (
     SpikeDetector,
     append_feature_history,
     load_state,
+    record_alert_in_state,
     save_state,
 )
 from .features import compute_market_features
@@ -165,14 +166,7 @@ def main() -> int:
     # 11. Persist state.json — cooldown fields only updated if delivery
     #     succeeded, but feature_history (already appended) is always saved.
     if delivered:
-        state.update({
-            "last_alert_time": price_data["timestamp"],
-            "last_alert_price": price_data["price_usd"],
-            "last_alert_direction": spike["direction"],
-            "last_spike_window": spike["window"],
-            "last_spike_change": spike["change"],
-            "last_spike_score": spike.get("score"),
-        })
+        record_alert_in_state(state, spike, price_data)
         save_state(STATE_PATH, state)
         log.info("Cooldown state + history persisted.")
     else:

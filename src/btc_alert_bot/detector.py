@@ -29,8 +29,9 @@ from .features import (
 log = logging.getLogger(__name__)
 
 # --- Legacy fallback thresholds (used if Bybit features are unavailable) ---
-THRESHOLD_1H_PCT = 2.0
-THRESHOLD_24H_PCT = 5.0
+# 24h was removed at the user's request — only fire on horizons that
+# correspond to actionable spikes (≤1h).
+THRESHOLD_1H_PCT = 2.5
 
 # --- Composite-score weights & gates (Phase 1 initial values from Codex) ---
 SCORE_WEIGHTS = {
@@ -66,14 +67,31 @@ ADAPTIVE_REF_ATR_PCT_5M = 0.10
 ADAPTIVE_REF_ATR_PCT_15M = 0.10
 
 # "Always alert" overrides — catch obvious moves even with thin history.
+# 24h was removed at the user's request (no need to alert on multi-day moves).
 HARD_FALLBACK_RETURN_5M_PCT = 1.0
 HARD_FALLBACK_RETURN_15M_PCT = 1.5
-HARD_FALLBACK_RETURN_1H_PCT = 2.0
-HARD_FALLBACK_RETURN_24H_PCT = 5.0
+HARD_FALLBACK_RETURN_1H_PCT = 2.5
 
 # Cooldown: same direction is suppressed longer than a reversal.
 COOLDOWN_SAME_DIR_MIN = 90
 COOLDOWN_OPP_DIR_MIN = 30
+
+# ---------------------------------------------------------------------------
+# Timeframe tiers — controls how alerts of different windows suppress each
+# other. Per the user's design:
+#   short  (1m/3m/5m) : the primary detection band
+#   medium (15m)       : suppressed when a recent short-tier alert exists
+#   long   (1h)        : independent — fires only on large moves
+# Anything longer than 1h does not generate alerts at all.
+# ---------------------------------------------------------------------------
+WINDOW_TIER: dict[str, str] = {
+    "1m": "short",
+    "3m": "short",
+    "5m": "short",
+    "15m": "medium",
+    "1h": "long",
+}
+TIER_RANK = {"short": 0, "medium": 1, "long": 2}
 
 # Ring buffer: how many feature snapshots to retain in state.json.
 FEATURE_HISTORY_MAX = HIST_LOOKBACK_BARS * 2  # ~48h of 5-min bars
@@ -98,6 +116,32 @@ def save_state(path: Path, state: dict) -> None:
     path.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def record_alert_in_state(state: dict, spike: dict, price_data: dict) -> None:
+    """Update ``state`` with both a tier-keyed alert record and the legacy flat fields.
+
+    The tier-keyed entries (``last_alert_short_*``, ``last_alert_medium_*``,
+    ``last_alert_long_*``) drive the new cooldown logic. The flat
+    ``last_alert_*`` fields stay for backwards compatibility (legacy
+    consumers + Codex audit trail).
+    """
+    window = spike.get("window", "")
+    direction = spike.get("direction", "up")
+    tier = WINDOW_TIER.get(window)
+    ts = price_data.get("timestamp")
+    if tier and ts:
+        state[f"last_alert_{tier}_time"] = ts
+        state[f"last_alert_{tier}_direction"] = direction
+        state[f"last_alert_{tier}_window"] = window
+    state.update({
+        "last_alert_time": ts,
+        "last_alert_price": price_data.get("price_usd"),
+        "last_alert_direction": direction,
+        "last_spike_window": window,
+        "last_spike_change": spike.get("change"),
+        "last_spike_score": spike.get("score"),
+    })
 
 
 def append_feature_history(state: dict, features: dict) -> None:
@@ -131,31 +175,27 @@ class SpikeDetector:
 
     # ---- Legacy CoinGecko-only path (fallback) -----------------------------
     def check_legacy(self, price_data: dict) -> dict | None:
-        """Original simple-threshold detection, used when Bybit features absent."""
-        direction = self._cooldown_direction(price_data["timestamp"])
-        ch_1h = price_data["change_1h"]
-        ch_24h = price_data["change_24h"]
+        """Original simple-threshold detection, used when Bybit features absent.
 
-        spike: dict | None = None
-        if abs(ch_1h) >= THRESHOLD_1H_PCT:
-            spike = {
-                "window": "1h",
-                "change": ch_1h,
-                "direction": "up" if ch_1h > 0 else "down",
-                "score": None,
-                "reasons": [f"1h move {ch_1h:+.2f}% over ±{THRESHOLD_1H_PCT}% (legacy)"],
-                "features": None,
-            }
-        elif abs(ch_24h) >= THRESHOLD_24H_PCT:
-            spike = {
-                "window": "24h",
-                "change": ch_24h,
-                "direction": "up" if ch_24h > 0 else "down",
-                "score": None,
-                "reasons": [f"24h move {ch_24h:+.2f}% over ±{THRESHOLD_24H_PCT}% (legacy)"],
-                "features": None,
-            }
-        if spike and self._suppressed_by_cooldown(direction, spike["direction"]):
+        Now respects the tier-aware suppression rules and only fires on
+        the 1h horizon (24h alerts were removed at the user's request).
+        """
+        ch_1h = price_data["change_1h"]
+        if abs(ch_1h) < THRESHOLD_1H_PCT:
+            return None
+        spike = {
+            "window": "1h",
+            "change": ch_1h,
+            "direction": "up" if ch_1h > 0 else "down",
+            "score": None,
+            "reasons": [
+                f"1h move {ch_1h:+.2f}% over ±{THRESHOLD_1H_PCT}% (legacy)"
+            ],
+            "features": None,
+        }
+        if self._is_suppressed(
+            spike["window"], spike["direction"], price_data["timestamp"]
+        ):
             return None
         return spike
 
@@ -213,7 +253,9 @@ class SpikeDetector:
         fired_change: float = 0.0
         fired_direction: str = "up"
 
-        # --- 3. Hard fallback first (catches obvious moves regardless of score) ---
+        # --- 3. Hard fallback first (catches obvious moves regardless of score).
+        #        We probe in tier-priority order: short windows first, then
+        #        medium, then long. 24h+ are intentionally not considered.
         if abs(return_5m) >= HARD_FALLBACK_RETURN_5M_PCT:
             fired_window = "5m"
             fired_change = return_5m
@@ -229,11 +271,6 @@ class SpikeDetector:
             fired_change = features["return_1h"]
             fired_direction = "up" if features["return_1h"] >= 0 else "down"
             reasons.append(f"1h move {fired_change:+.2f}% over hard floor")
-        elif abs(features["return_24h"]) >= HARD_FALLBACK_RETURN_24H_PCT:
-            fired_window = "24h"
-            fired_change = features["return_24h"]
-            fired_direction = "up" if features["return_24h"] >= 0 else "down"
-            reasons.append(f"24h move {fired_change:+.2f}% over hard floor")
 
         # --- 4. Composite gate: independent 5m and 15m windows ---
         # 5m is the responsive timeframe — fires often. 15m is the trend-
@@ -301,8 +338,12 @@ class SpikeDetector:
             )
             return None
 
-        # --- 5. Cooldown (directional) ---
-        if self._suppressed_by_cooldown(direction_cd, fired_direction):
+        # --- 5. Cooldown (tier-aware): a recent shorter-tier alert
+        #        suppresses medium-tier candidates; same-tier same-direction
+        #        cooldown still applies.
+        if self._is_suppressed(
+            fired_window, fired_direction, price_data["timestamp"]
+        ):
             return None
 
         return {
@@ -316,17 +357,20 @@ class SpikeDetector:
 
     # ---- Internal helpers --------------------------------------------------
     def _hard_fallback_only(self, features: dict, price_data: dict) -> dict | None:
-        """Pre-history-warmup gate: only fire on obvious moves."""
-        direction_cd = self._cooldown_direction(price_data["timestamp"])
+        """Pre-history-warmup gate: only fire on obvious moves.
+
+        Probes the same window list as the steady-state path: short tier
+        first (5m), then medium (15m), then long (1h). Anything longer
+        than 1h was removed at the user's request.
+        """
         for window, value, hard in (
             ("5m",  features.get("return_5m",  0.0), HARD_FALLBACK_RETURN_5M_PCT),
             ("15m", features.get("return_15m", 0.0), HARD_FALLBACK_RETURN_15M_PCT),
             ("1h",  features.get("return_1h",  0.0), HARD_FALLBACK_RETURN_1H_PCT),
-            ("24h", features.get("return_24h", 0.0), HARD_FALLBACK_RETURN_24H_PCT),
         ):
             if abs(value) >= hard:
                 direction = "up" if value >= 0 else "down"
-                if self._suppressed_by_cooldown(direction_cd, direction):
+                if self._is_suppressed(window, direction, price_data["timestamp"]):
                     return None
                 return {
                     "window": window,
@@ -338,45 +382,123 @@ class SpikeDetector:
                 }
         return None
 
+    def _last_tier_alert(self, tier: str) -> tuple[datetime, str] | None:
+        """Return (ts, direction) of the most recent alert in ``tier``, if any.
+
+        Backward-compatible: if only the legacy flat keys exist
+        (``last_alert_time``/``last_alert_direction``), they are mapped to
+        the tier of ``last_spike_window`` (defaulting to ``short``).
+        """
+        ts_iso = self.state.get(f"last_alert_{tier}_time")
+        direction = self.state.get(f"last_alert_{tier}_direction")
+        if ts_iso and direction:
+            try:
+                return datetime.fromisoformat(ts_iso), direction
+            except Exception:
+                return None
+        # Legacy migration path.
+        legacy_ts = self.state.get("last_alert_time")
+        legacy_dir = self.state.get("last_alert_direction")
+        legacy_window = self.state.get("last_spike_window")
+        if legacy_ts and legacy_dir and legacy_window:
+            legacy_tier = WINDOW_TIER.get(legacy_window, "short")
+            if legacy_tier == tier:
+                try:
+                    return datetime.fromisoformat(legacy_ts), legacy_dir
+                except Exception:
+                    return None
+        return None
+
     def _cooldown_direction(self, now_iso: str) -> str | None:
-        """Return the last alert's direction if cooldown is still active, else None."""
-        last = self.state.get("last_alert_time")
-        last_dir = self.state.get("last_alert_direction")
-        if not last or not last_dir:
+        """Legacy helper — returns the most recent SHORT-tier alert's direction.
+
+        Kept for compatibility with the realtime fast-track call site and
+        with tests that pre-date the tier system. New call sites should
+        use _is_suppressed() directly.
+        """
+        last = self._last_tier_alert("short")
+        if not last:
             return None
+        ts, direction = last
         try:
-            elapsed_min = (
-                datetime.fromisoformat(now_iso) - datetime.fromisoformat(last)
-            ).total_seconds() / 60
+            elapsed = (datetime.fromisoformat(now_iso) - ts).total_seconds() / 60
         except Exception:
             return None
-        # Both windows shrunk to 0 means "no cooldown".
-        if elapsed_min >= COOLDOWN_SAME_DIR_MIN:
-            return None
-        return last_dir
+        return direction if elapsed < COOLDOWN_SAME_DIR_MIN else None
 
     def _suppressed_by_cooldown(
         self, last_dir: str | None, current_dir: str
     ) -> bool:
+        """Legacy helper — applies SHORT-tier cooldown for fast-track use."""
         if last_dir is None:
             return False
-        # Reversal: shorter cooldown.
+        last = self._last_tier_alert("short")
+        if not last:
+            return False
+        ts, _ = last
+        elapsed = (
+            datetime.now(ts.tzinfo) - ts
+        ).total_seconds() / 60
         if last_dir != current_dir:
-            last_iso = self.state.get("last_alert_time")
-            try:
-                elapsed = (
-                    datetime.now().astimezone()
-                    - datetime.fromisoformat(last_iso)
-                ).total_seconds() / 60
-                if elapsed >= COOLDOWN_OPP_DIR_MIN:
-                    return False
+            if elapsed >= COOLDOWN_OPP_DIR_MIN:
+                return False
+            log.info(
+                "Cooldown active (reversal, short tier): %.1f / %d min",
+                elapsed, COOLDOWN_OPP_DIR_MIN,
+            )
+            return True
+        log.info("Cooldown active (same direction, short tier)")
+        return True
+
+    def _is_suppressed(self, window: str, direction: str, now_iso: str) -> bool:
+        """Tier-aware cooldown.
+
+        Suppression rules:
+        - Same tier, same direction → 90min cooldown.
+        - Same tier, opposite direction → 30min cooldown.
+        - Cross-tier: a recent SHORT-tier alert (same direction) suppresses
+          MEDIUM-tier candidates. Long tier is independent.
+        """
+        if window not in WINDOW_TIER:
+            log.warning("Unknown window %r — not suppressing", window)
+            return False
+        spike_tier = WINDOW_TIER[window]
+        try:
+            now = datetime.fromisoformat(now_iso)
+        except Exception:
+            return False
+
+        # 1) Same-tier cooldown.
+        same_tier_last = self._last_tier_alert(spike_tier)
+        if same_tier_last:
+            ts, last_dir = same_tier_last
+            elapsed = (now - ts).total_seconds() / 60
+            if last_dir == direction and elapsed < COOLDOWN_SAME_DIR_MIN:
                 log.info(
-                    "Cooldown active (reversal): %.1f / %d min",
-                    elapsed, COOLDOWN_OPP_DIR_MIN,
+                    "Suppressed: %s tier same-direction cooldown "
+                    "(%.1f / %d min)", spike_tier, elapsed,
+                    COOLDOWN_SAME_DIR_MIN,
                 )
                 return True
-            except Exception:
+            if last_dir != direction and elapsed < COOLDOWN_OPP_DIR_MIN:
+                log.info(
+                    "Suppressed: %s tier reversal cooldown (%.1f / %d min)",
+                    spike_tier, elapsed, COOLDOWN_OPP_DIR_MIN,
+                )
                 return True
-        # Same direction: full cooldown enforced inside _cooldown_direction()
-        log.info("Cooldown active (same direction)")
-        return True
+
+        # 2) Cross-tier: medium suppressed by recent short-tier alert.
+        if spike_tier == "medium":
+            short_last = self._last_tier_alert("short")
+            if short_last:
+                ts, last_dir = short_last
+                elapsed = (now - ts).total_seconds() / 60
+                if last_dir == direction and elapsed < COOLDOWN_SAME_DIR_MIN:
+                    log.info(
+                        "Suppressed: medium-tier alert preempted by "
+                        "short-tier alert %.1f min ago", elapsed,
+                    )
+                    return True
+
+        # Long tier (1h) and short tier are independent of each other.
+        return False
