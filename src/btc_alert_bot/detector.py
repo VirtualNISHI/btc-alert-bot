@@ -107,6 +107,19 @@ WINDOW_TIER: dict[str, str] = {
 }
 TIER_RANK = {"short": 0, "medium": 1, "long": 2}
 
+# Intra-tier window rank — used by _is_suppressed() to enforce the
+# user's rule that *faster windows preempt slower windows* but not the
+# other way around. A 1m alert silences subsequent same-direction 3m/5m
+# alerts (no point repeating the news), but a fresh 1m fast-track AFTER
+# a 5m alert is still allowed through as the "急変動" override.
+WINDOW_RANK: dict[str, int] = {
+    "1m": 0,
+    "3m": 1,
+    "5m": 2,
+    "15m": 0,   # only one window in the medium tier
+    "1h":  0,   # only one window in the long tier
+}
+
 # Ring buffer: how many feature snapshots to retain in state.json.
 FEATURE_HISTORY_MAX = HIST_LOOKBACK_BARS * 2  # ~48h of 5-min bars
 
@@ -396,8 +409,10 @@ class SpikeDetector:
                 }
         return None
 
-    def _last_tier_alert(self, tier: str) -> tuple[datetime, str] | None:
-        """Return (ts, direction) of the most recent alert in ``tier``, if any.
+    def _last_tier_alert(
+        self, tier: str
+    ) -> tuple[datetime, str, str | None] | None:
+        """Return ``(ts, direction, window)`` of the most recent alert in ``tier``.
 
         Backward-compatible: if only the legacy flat keys exist
         (``last_alert_time``/``last_alert_direction``), they are mapped to
@@ -405,9 +420,10 @@ class SpikeDetector:
         """
         ts_iso = self.state.get(f"last_alert_{tier}_time")
         direction = self.state.get(f"last_alert_{tier}_direction")
+        window = self.state.get(f"last_alert_{tier}_window")
         if ts_iso and direction:
             try:
-                return datetime.fromisoformat(ts_iso), direction
+                return datetime.fromisoformat(ts_iso), direction, window
             except Exception:
                 return None
         # Legacy migration path.
@@ -418,7 +434,11 @@ class SpikeDetector:
             legacy_tier = WINDOW_TIER.get(legacy_window, "short")
             if legacy_tier == tier:
                 try:
-                    return datetime.fromisoformat(legacy_ts), legacy_dir
+                    return (
+                        datetime.fromisoformat(legacy_ts),
+                        legacy_dir,
+                        legacy_window,
+                    )
                 except Exception:
                     return None
         return None
@@ -433,7 +453,7 @@ class SpikeDetector:
         last = self._last_tier_alert("short")
         if not last:
             return None
-        ts, direction = last
+        ts, direction, _ = last
         try:
             elapsed = (datetime.fromisoformat(now_iso) - ts).total_seconds() / 60
         except Exception:
@@ -449,7 +469,7 @@ class SpikeDetector:
         last = self._last_tier_alert("short")
         if not last:
             return False
-        ts, _ = last
+        ts, _, _ = last
         elapsed = (
             datetime.now(ts.tzinfo) - ts
         ).total_seconds() / 60
@@ -486,32 +506,51 @@ class SpikeDetector:
             spike_tier, COOLDOWN_SAME_DIR_MIN
         )
 
-        # 1) Same-tier cooldown.
+        # 1) Same-tier cooldown — with INTRA-TIER hierarchy. Within the
+        #    short tier (1m/3m/5m), a faster window's fire silences only
+        #    SLOWER-or-equal candidates; the reverse is allowed through
+        #    so a fresh 1m fast-track after a 5m alert can still fire as
+        #    the "急変動" override.
         same_tier_last = self._last_tier_alert(spike_tier)
         if same_tier_last:
-            ts, last_dir = same_tier_last
+            ts, last_dir, last_window = same_tier_last
             elapsed = (now - ts).total_seconds() / 60
             if last_dir == direction and elapsed < same_dir_cooldown:
+                # Unknown last_window (e.g. pre-upgrade state files that
+                # wrote time/direction but not window) is treated as
+                # conservatively suppressive so we never silently lose
+                # cooldown across deployment upgrades.
+                last_rank = WINDOW_RANK.get(last_window or "")
+                cur_rank = WINDOW_RANK.get(window, 99)
+                if last_rank is None or cur_rank >= last_rank:
+                    log.info(
+                        "Suppressed: %s tier same-direction cooldown "
+                        "(%.1f / %d min, last=%s, cur=%s rank=%d)",
+                        spike_tier, elapsed, same_dir_cooldown,
+                        last_window, window, cur_rank,
+                    )
+                    return True
+                # else: candidate is FASTER than last fire — let through.
                 log.info(
-                    "Suppressed: %s tier same-direction cooldown "
-                    "(%.1f / %d min)", spike_tier, elapsed, same_dir_cooldown,
+                    "Allowing %s through: faster than recent %s alert "
+                    "(rank %d < %d, %.1f min ago)",
+                    window, last_window, cur_rank, last_rank, elapsed,
                 )
-                return True
-            if last_dir != direction and elapsed < COOLDOWN_OPP_DIR_MIN:
+            elif last_dir != direction and elapsed < COOLDOWN_OPP_DIR_MIN:
                 log.info(
                     "Suppressed: %s tier reversal cooldown (%.1f / %d min)",
                     spike_tier, elapsed, COOLDOWN_OPP_DIR_MIN,
                 )
                 return True
 
-        # 2) Cross-tier: medium suppressed by recent short-tier alert
-        #    same-direction within the medium-tier window. This prevents
-        #    a 15m alert from re-firing the same trend that already fired
-        #    on a 5m bar earlier.
+        # 2) Cross-tier: medium (15m) is suppressed by ANY recent
+        #    same-direction short-tier alert (1m/3m/5m). The medium
+        #    tier's longer cooldown applies — short-tier news takes
+        #    precedence over the slower 15m view of the same trend.
         if spike_tier == "medium":
             short_last = self._last_tier_alert("short")
             if short_last:
-                ts, last_dir = short_last
+                ts, last_dir, _ = short_last
                 elapsed = (now - ts).total_seconds() / 60
                 if last_dir == direction and elapsed < same_dir_cooldown:
                     log.info(
