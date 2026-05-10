@@ -71,10 +71,11 @@ INST_ID = "BTC-USDT-SWAP"
 # too high; 1% in 60s on $80k BTC is ~$800 — a genuine event, not noise.
 FAST_TRACK_RETURN_1M_PCT = float(os.getenv("FAST_TRACK_RETURN_1M_PCT", "1.0"))
 
-# 3m fast-track: 1.3% in 3 minutes keeps the bar at "real news" level
-# rather than triggering on intra-bar wicks. Raised 0.7 → 1.3 to match
-# the new 1m calibration.
-FAST_TRACK_RETURN_3M_PCT = float(os.getenv("FAST_TRACK_RETURN_3M_PCT", "1.3"))
+# 3m fast-track: per-user request, raised to 3.0% so this path only
+# catches genuine flash events (~$2,400 on $80k BTC in 3 minutes is
+# major-news territory). The lower 5m hard floor (1.5%) still covers
+# sustained 5-min runs — they don't need a separate 3m hit.
+FAST_TRACK_RETURN_3M_PCT = float(os.getenv("FAST_TRACK_RETURN_3M_PCT", "3.0"))
 
 STATE_PATH = Path("data/state.json")
 HISTORY_DB_PATH = Path("data/history.sqlite")
