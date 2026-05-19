@@ -83,7 +83,9 @@ NEWS_LOOKBACK_MIN = 90
 
 # Hard wall-time budget for gather_factors() so a single slow source can't
 # block the whole alert pipeline. Stragglers are logged and dropped.
-GATHER_FACTORS_DEADLINE_S = 30.0
+# Raised 30 → 40s after adding Grok x_search which takes 15-25s for its
+# multi-step tool-call pipeline (keyword + semantic search + synthesis).
+GATHER_FACTORS_DEADLINE_S = 40.0
 
 # Surrounding window for matching macro events to the spike.
 MACRO_WINDOW_HOURS = 2
