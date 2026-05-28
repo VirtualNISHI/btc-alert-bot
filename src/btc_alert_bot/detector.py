@@ -31,7 +31,13 @@ log = logging.getLogger(__name__)
 # --- Legacy fallback thresholds (used if Bybit features are unavailable) ---
 # 24h was removed at the user's request — only fire on horizons that
 # correspond to actionable spikes (≤1h).
-THRESHOLD_1H_PCT = 2.5
+# Lowered 2.5 → 2.0: user observed a sustained "slow grind" sell-off
+# (5月28日 BTC: -1.5% over 5 hours, peak 1h slope -1.49%) that didn't
+# fire because every individual 1m/3m/5m/15m window stayed below floor.
+# 2.0% catches that band without much more noise — historically the
+# 1h moves between 1.5% and 2.5% are uncommon enough that the extra
+# alerts stay actionable.
+THRESHOLD_1H_PCT = 2.0
 
 # --- Composite-score weights & gates (Phase 1 initial values from Codex) ---
 SCORE_WEIGHTS = {
@@ -69,7 +75,10 @@ ADAPTIVE_REF_ATR_PCT_15M = 0.10
 # 24h was removed at the user's request (no need to alert on multi-day moves).
 HARD_FALLBACK_RETURN_5M_PCT = 1.0
 HARD_FALLBACK_RETURN_15M_PCT = 2.0
-HARD_FALLBACK_RETURN_1H_PCT = 2.5
+# Kept in lockstep with THRESHOLD_1H_PCT — there is no separate
+# composite-gate base for 1h, so both knobs collapse to the same
+# value. Lowered 2.5 → 2.0 alongside.
+HARD_FALLBACK_RETURN_1H_PCT = 2.0
 
 # Cooldown: same direction is suppressed longer than a reversal.
 # Per-tier durations let the medium tier (15m) stay quieter than the
