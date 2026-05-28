@@ -49,6 +49,12 @@ def gemini_generate_text(
                 system_instruction=system or None,
                 temperature=temperature,
                 max_output_tokens=max_tokens,
+                # gemini-2.5-flash 系は thinking モード搭載で、
+                # 既定だと max_output_tokens の大半が reasoning に消費され
+                # 本文が途中で切れる (24字で打ち切られた事例あり)。
+                # 翻訳/要約は reasoning 不要なので明示的に OFF。
+                # この設定は thinking 非搭載モデル (flash-lite / 2.0系) では無視される。
+                thinking_config=_thinking_off(genai_types),
             ),
         )
         text = (getattr(resp, "text", None) or "").strip()
@@ -59,6 +65,19 @@ def gemini_generate_text(
         return text
     except Exception as exc:  # noqa: BLE001 - intentional: any failure -> fallback
         log.warning("gemini failed: %s", exc)
+        return None
+
+
+def _thinking_off(genai_types) -> Any | None:
+    """ThinkingConfig(thinking_budget=0) を返す。SDK 旧版で型が無ければ None。
+
+    `google-genai` の比較的新しいバージョンにしか ``ThinkingConfig`` は無い。
+    SDK が古い環境では AttributeError が出るので None を返して通常動作に戻す
+    (その場合は thinking が効いたまま — 古い SDK は基本 2.5-flash 自体使えない)。
+    """
+    try:
+        return genai_types.ThinkingConfig(thinking_budget=0)
+    except AttributeError:
         return None
 
 
@@ -95,6 +114,9 @@ def gemini_generate_structured(
                 response_schema=schema,
                 temperature=temperature,
                 max_output_tokens=max_tokens,
+                # thinking で max_output_tokens を食い潰されないように OFF。
+                # 構造化出力でも同じ罠が成立する (JSON 出力前に reasoning 終了せず切れる)。
+                thinking_config=_thinking_off(genai_types),
             ),
         )
         parsed = getattr(resp, "parsed", None)
@@ -119,6 +141,86 @@ def gemini_generate_structured(
     except Exception as exc:  # noqa: BLE001
         log.warning("gemini structured failed: %s", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Reasoning-model adjusters
+# ---------------------------------------------------------------------------
+#
+# OpenAI / Grok の上位モデルは「reasoning tokens」(thinking) を消費し、素朴に
+# max_tokens を送ると本文が空になる事故が起きる (Gemini 2.5 flash と同じ症状)。
+# 加えて API シグネチャ自体が異なる:
+#
+#   OpenAI o系 / gpt-5:
+#     - `max_tokens` 不可 → `max_completion_tokens` 必須
+#     - `temperature` 固定 (1) → 送ると 400
+#     - `reasoning_effort` で reasoning 量を絞れる (gpt-5 は "minimal" も可)
+#
+#   xAI Grok 3 / 4:
+#     - `reasoning_effort=low` で thinking を最小化 (grok-3 系)
+#     - grok-4 は reasoning 強制 ON 不可 → max_tokens を増やして対応するしかない
+#
+# 下の関数群はモデル名を見て payload を整形する。デフォルトモデル
+# (gpt-4o-mini / grok-2-1212) はどちらも reasoning 無しなので noop。
+
+
+def _openai_is_reasoning(model: str) -> bool:
+    """o1/o3/o4/o5/gpt-5 系なら True。これらは API シグネチャが違う。"""
+    m = (model or "").lower()
+    if m.startswith(("o1", "o3", "o4", "o5")):
+        return True
+    if m.startswith("gpt-5"):
+        return True
+    return False
+
+
+def _openai_apply_reasoning_adjustments(payload: dict, *, model: str) -> dict:
+    """OpenAI reasoning モデル用に payload を変換。non-reasoning モデルは無加工。
+
+    - ``max_tokens`` → ``max_completion_tokens`` にリネーム
+    - ``temperature`` を削除 (o系は 1 固定、指定不可)
+    - ``reasoning_effort`` を追記 (gpt-5: "minimal" / o系: "low" — トークン節約)
+    """
+    if not _openai_is_reasoning(model):
+        return payload
+    if "max_tokens" in payload:
+        payload["max_completion_tokens"] = payload.pop("max_tokens")
+    payload.pop("temperature", None)
+    if model.lower().startswith("gpt-5"):
+        # gpt-5 は "minimal" でほぼ thinking なし (= 翻訳/要約に最適)
+        payload.setdefault("reasoning_effort", "minimal")
+    else:
+        # o-series は "low" が最小 ("minimal" 非対応)
+        payload.setdefault("reasoning_effort", "low")
+    return payload
+
+
+def _grok_is_reasoning(model: str) -> bool:
+    """grok-3 系以降は reasoning 持ち。grok-2 系は無し。"""
+    m = (model or "").lower()
+    # grok-3, grok-3-mini, grok-3-fast, grok-4, grok-4-fast …
+    if m.startswith(("grok-3", "grok-4", "grok-5")):
+        return True
+    return False
+
+
+def _grok_apply_reasoning_adjustments(payload: dict, *, model: str) -> dict:
+    """Grok reasoning モデル用に payload を補正。non-reasoning モデルは無加工。
+
+    - grok-3 系: ``reasoning_effort="low"`` で thinking を最小化
+    - grok-4 系: thinking 強制 ON のため reasoning_effort は効かない。max_tokens
+      を 1.5x に増やしてバッファを確保 (それでも超えれば本文切れる)
+    """
+    if not _grok_is_reasoning(model):
+        return payload
+    m = model.lower()
+    if m.startswith(("grok-3", "grok-5")):
+        payload.setdefault("reasoning_effort", "low")
+    elif m.startswith("grok-4"):
+        # grok-4 は reasoning 制御不能 → トークン枠を増やすしかない
+        if "max_tokens" in payload:
+            payload["max_tokens"] = int(payload["max_tokens"] * 1.5) + 512
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +254,7 @@ def grok_generate_text(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    payload = _grok_apply_reasoning_adjustments(payload, model=model)
     try:
         with httpx.Client(timeout=config.HTTP_TIMEOUT) as client:
             r = client.post(
@@ -214,6 +317,7 @@ def grok_generate_structured(
         "temperature": temperature,
         "response_format": {"type": "json_object"},
     }
+    payload = _grok_apply_reasoning_adjustments(payload, model=model)
     try:
         with httpx.Client(timeout=config.HTTP_TIMEOUT) as client:
             r = client.post(
@@ -276,6 +380,7 @@ def openai_generate_text(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    payload = _openai_apply_reasoning_adjustments(payload, model=model)
     try:
         with httpx.Client(timeout=config.HTTP_TIMEOUT) as client:
             r = client.post(
@@ -343,6 +448,7 @@ def openai_generate_structured(
         "temperature": temperature,
         "response_format": response_format,
     }
+    payload = _openai_apply_reasoning_adjustments(payload, model=model)
     try:
         with httpx.Client(timeout=config.HTTP_TIMEOUT) as client:
             r = client.post(
