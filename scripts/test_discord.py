@@ -63,15 +63,24 @@ def main() -> int:
         log.warning("Bybit fetch failed: %s — features will be empty", e)
         features = {}
 
-    # 3. Force a spike. Use the real 15m return if visible, otherwise fabricate.
-    real_change = features.get("return_15m", 0.0) if features else price_data["change_1h"]
+    # 3. Force a spike. Prefer the actual recent movement so the test alert
+    # represents reality (especially important when ALLOW_TEST_X_POST=true).
+    # Cascade: 15m → 1h → fabricated +2.5%.
+    real_change = features.get("return_15m", 0.0) if features else 0.0
+    if abs(real_change) < 0.5:
+        # Fall back to 1h return — slow-grind sell-offs look small at 15m
+        # but obvious at 1h. Better for a realistic test than fabrication.
+        real_change = features.get("return_1h", 0.0) if features else price_data.get("change_1h", 0.0)
     if abs(real_change) < 0.5:
         log.info(
-            "Real movement tiny (%.2f%%) — fabricating +2.5%% for test", real_change
+            "Real movement tiny (15m=%.2f%%, 1h=%.2f%%) — fabricating +2.5%% for test",
+            (features or {}).get("return_15m", 0.0),
+            (features or {}).get("return_1h", 0.0),
         )
         forced_change = 2.5
     else:
         forced_change = real_change
+        log.info("Using real movement: %+.2f%% for test", forced_change)
     # Use a short-tier window so test runs don't appear as "15m" alerts
     # in the production Discord (15m is intentionally rare per spec).
     spike = {
@@ -131,12 +140,23 @@ def main() -> int:
         chart_png=chart_png, window_ohlcv=window_ohlcv,
     )
 
-    # 6b. X is INTENTIONALLY skipped in test mode — test posts use a
-    #     fabricated +2.5% spike, and posting that to X would publish a
-    #     misleading alert to real followers. X posts are reserved for
-    #     real production fires from realtime.py / main.py.
-    delivered_x = False
-    log.info("X post skipped (test_discord is Discord-only by design)")
+    # 6b. X posting policy: BY DEFAULT skipped — test posts use a fabricated
+    #     spike and posting that to real X followers is misleading.
+    #     One-time override: set env ALLOW_TEST_X_POST=true. Each run of
+    #     this script with the override consumes ~1 of the 500/month X
+    #     Free-tier quota. Use sparingly and only when the user has
+    #     explicitly authorized it ("Xにも投稿（特例）").
+    if os.getenv("ALLOW_TEST_X_POST", "").lower() in ("1", "true", "yes"):
+        log.warning(
+            "ALLOW_TEST_X_POST=true — posting test to X (real audience!)"
+        )
+        delivered_x = post_x(summary, price_data, spike, chart_png=chart_png)
+        log.info("X post result: delivered=%s", delivered_x)
+    else:
+        delivered_x = False
+        log.info(
+            "X post skipped (default Discord-only; set ALLOW_TEST_X_POST=true to override)"
+        )
 
     # 7. Record to history DB (the test_discord pipeline mirrors main.py).
     alert_id = record_alert(

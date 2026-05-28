@@ -21,14 +21,18 @@ DEEPL_API_KEY = _env("DEEPL_API_KEY")
 
 # Models (override via env if a higher-quota or different model is needed)
 #
-# Gemini default = gemini-2.5-flash-lite:
-#   - flash (無印) は thinking モード搭載で max_output_tokens の大半を
-#     reasoning に食われ、低 max_tokens 時に本文が途中で切れる事例あり
-#     (24字で打ち切られたケース確認済み)。
-#   - lite は thinking 非搭載で軽量、翻訳/要約には十分。
-#   - env で flash や 2.5-pro 等に上書きしても providers.py 側で
-#     thinking_budget=0 を強制しているので安全。
-GEMINI_MODEL = _env("JP_TRANSLATOR_GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Gemini default = gemini-2.5-flash:
+#   - flash (無印) は thinking モード搭載だが、providers.py 側で
+#     thinking_budget=0 を強制しているので reasoning による
+#     max_output_tokens 食い潰し問題は無効化済み。
+#   - flash は flash-lite より日本語の語彙・敬体・含意表現がワンランク
+#     上 (BTC 解説で「観測される」「示唆される」等の慎重な語法を
+#     正しく使い分ける)。reasoning 切れば速度差もほぼ無視できる。
+#   - flash-lite に戻したい場合は env JP_TRANSLATOR_GEMINI_MODEL で上書き可。
+GEMINI_MODEL = _env("JP_TRANSLATOR_GEMINI_MODEL", "gemini-2.5-flash")
+# OpenAI/Grok は LLM チェーンの 2 番手/3 番手フォールバック。
+# providers.py の reasoning 調整層が上位モデルでも API シグネチャを
+# 自動で切り替える (max_completion_tokens / reasoning_effort 等)。
 GROK_MODEL = _env("JP_TRANSLATOR_GROK_MODEL", "grok-2-1212")
 OPENAI_MODEL = _env("JP_TRANSLATOR_OPENAI_MODEL", "gpt-4o-mini")
 
