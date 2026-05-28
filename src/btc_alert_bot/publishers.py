@@ -16,6 +16,42 @@ import tweepy
 _JST = timezone(timedelta(hours=9))
 
 
+def _format_window_jp(window: str) -> str:
+    """Render an alert window like ``5m`` / ``1h`` as ``5分`` / ``1時間``.
+
+    Used in the title snippet ``○○分で○.○○%下落`` so the user can see
+    the timeframe of the move at a glance. Falls back to the raw string
+    on unknown suffixes.
+    """
+    if not window:
+        return ""
+    if window.endswith("m"):
+        return f"{window[:-1]}分"
+    if window.endswith("h"):
+        return f"{window[:-1]}時間"
+    return window
+
+
+def _format_move_snippet(spike: dict) -> str:
+    """Build ``5分で0.50%下落`` from a spike dict, or empty if data missing.
+
+    Pulls ``window``, ``change`` (signed pct), ``direction`` straight off
+    the spike dict that the detector / fast-track build. Always uses the
+    absolute % value — direction is conveyed by the verb 上昇/下落.
+    """
+    window = spike.get("window") or ""
+    change = spike.get("change")
+    if not window or change is None:
+        return ""
+    direction = spike.get("direction") or ("up" if float(change) >= 0 else "down")
+    verb = "上昇" if direction == "up" else "下落"
+    try:
+        pct = abs(float(change))
+    except (TypeError, ValueError):
+        return ""
+    return f"{_format_window_jp(window)}で{pct:.2f}%{verb}"
+
+
 def _format_jst(iso_ts: str | None) -> str:
     """Render an ISO UTC timestamp as ``YYYY/MM/DD HH:MM JST``.
 
@@ -170,7 +206,13 @@ def post_discord(
     # Direction-aware surge emoji right after 速報 so the user can tell
     # up/down at a glance even before reading the body.
     direction_emoji = "📈" if spike.get("direction") == "up" else "📉"
+    # Move snippet like "5分で0.50%下落" — shows the timeframe + magnitude
+    # the detector tripped on, right in the title so the user can decide
+    # whether to open the embed before reading the summary body.
+    move_snippet = _format_move_snippet(spike)
     title = f"🚨 BTC緊急価格速報{direction_emoji}"
+    if move_snippet:
+        title = f"{title} {move_snippet}"
     if jst_ts:
         title = f"{title} ({jst_ts})"
     embed = {
@@ -246,7 +288,13 @@ def post_x(
     # the Discord embed title, so cross-platform readers see the same
     # up/down marker.
     direction_emoji = "📈" if spike.get("direction") == "up" else "📉"
+    # Move snippet like "5分で0.50%下落" — mirrors the Discord title so
+    # cross-platform readers see identical headline content. Adds ~15
+    # weighted X chars, body budget still ≥160 weighted units.
+    move_snippet = _format_move_snippet(spike)
     header = "🚨 " + _to_bold_ascii("BTC") + f"緊急価格速報{direction_emoji}"
+    if move_snippet:
+        header = f"{header} {move_snippet}"
     jst_ts = _format_jst(price_data.get("timestamp"))
     if jst_ts:
         header = f"{header} ({jst_ts})"
