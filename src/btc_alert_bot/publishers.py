@@ -167,7 +167,10 @@ def post_discord(
         ])
 
     jst_ts = _format_jst(price_data.get("timestamp"))
-    title = "🚨 BTC緊急価格速報"
+    # Direction-aware surge emoji right after 速報 so the user can tell
+    # up/down at a glance even before reading the body.
+    direction_emoji = "📈" if spike.get("direction") == "up" else "📉"
+    title = f"🚨 BTC緊急価格速報{direction_emoji}"
     if jst_ts:
         title = f"{title} ({jst_ts})"
     embed = {
@@ -239,7 +242,11 @@ def post_x(
     #   a platform without markdown. Japanese chars stay regular.
     # - JST fire timestamp appended in parens so the user can correlate
     #   with their own chart timeline.
-    header = "🚨 " + _to_bold_ascii("BTC") + "緊急価格速報"
+    # Direction-aware surge emoji right after 速報 — same visual cue as
+    # the Discord embed title, so cross-platform readers see the same
+    # up/down marker.
+    direction_emoji = "📈" if spike.get("direction") == "up" else "📉"
+    header = "🚨 " + _to_bold_ascii("BTC") + f"緊急価格速報{direction_emoji}"
     jst_ts = _format_jst(price_data.get("timestamp"))
     if jst_ts:
         header = f"{header} ({jst_ts})"
