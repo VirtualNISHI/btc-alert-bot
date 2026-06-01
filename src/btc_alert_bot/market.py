@@ -180,13 +180,15 @@ _WINDOW_TO_OKX_BAR: dict[str, str] = {
     "5m":  "5m",
     "15m": "15m",
     "1h":  "1H",
+    "2h":  "2H",   # slow-grind detector
     # 24h+ no longer fires alerts (removed at the user's request) but we
     # leave the mapping here so a stale spike object doesn't crash.
     "24h": "1D",
 }
 
 _WINDOW_DURATION_S: dict[str, int] = {
-    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "1h": 3600, "24h": 86400,
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+    "1h": 3600, "2h": 7200, "24h": 86400,
 }
 
 

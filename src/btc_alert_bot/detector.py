@@ -79,6 +79,12 @@ HARD_FALLBACK_RETURN_15M_PCT = 2.0
 # composite-gate base for 1h, so both knobs collapse to the same
 # value. Lowered 2.5 → 2.0 alongside.
 HARD_FALLBACK_RETURN_1H_PCT = 2.0
+# 2h "slow grind" detector. Threshold 1.5% is intentionally below
+# 1h@2.0% intensity-wise — it specifically catches accumulating
+# moves that never produce a sharp 1h slope. Empirically, 6/1 BTC
+# moved -2.86%/24h with max 1h slope only 0.91% but 2h max 1.53%;
+# 1.5% threshold catches exactly that band.
+HARD_FALLBACK_RETURN_2H_PCT = 1.5
 
 # Cooldown: same direction is suppressed longer than a reversal.
 # Per-tier durations let the medium tier (15m) stay quieter than the
@@ -108,6 +114,7 @@ WINDOW_TIER: dict[str, str] = {
     "5m": "short",
     "15m": "medium",
     "1h": "long",
+    "2h": "long",   # slow-grind detector — shares the long tier with 1h
 }
 TIER_RANK = {"short": 0, "medium": 1, "long": 2}
 
@@ -116,12 +123,19 @@ TIER_RANK = {"short": 0, "medium": 1, "long": 2}
 # other way around. A 1m alert silences subsequent same-direction 3m/5m
 # alerts (no point repeating the news), but a fresh 1m fast-track AFTER
 # a 5m alert is still allowed through as the "急変動" override.
+#
+# Within the long tier, 1h preempts 2h: when a sharp 1h move fires,
+# the 2h cumulative is just a slower view of the same trend and would
+# duplicate the message. The reverse direction (2h fires first because
+# 1h was stuck at 1.5-1.9%, then 1h finally crosses 2.0%) lets the
+# faster 1h come through as a fresh fire.
 WINDOW_RANK: dict[str, int] = {
     "1m": 0,
     "3m": 1,
     "5m": 2,
     "15m": 0,   # only one window in the medium tier
-    "1h":  0,   # only one window in the long tier
+    "1h":  0,   # 1h is the faster of the two long-tier windows
+    "2h":  1,   # 2h is slower → preempted by recent same-direction 1h
 }
 
 # Ring buffer: how many feature snapshots to retain in state.json.
@@ -304,6 +318,14 @@ class SpikeDetector:
             fired_change = features["return_1h"]
             fired_direction = "up" if features["return_1h"] >= 0 else "down"
             reasons.append(f"1h move {fired_change:+.2f}% over hard floor")
+        elif abs(features.get("return_2h", 0.0)) >= HARD_FALLBACK_RETURN_2H_PCT:
+            # 2h slow-grind catch — probed AFTER 1h so a sharp move fires
+            # as "1h" first; only fires as "2h" when the move was too
+            # gradual to trip the 1h floor.
+            fired_window = "2h"
+            fired_change = features["return_2h"]
+            fired_direction = "up" if features["return_2h"] >= 0 else "down"
+            reasons.append(f"2h move {fired_change:+.2f}% over slow-grind floor")
 
         # --- 4. Composite gate: independent 5m and 15m windows ---
         # 5m is the responsive timeframe — fires often. 15m is the trend-
@@ -400,6 +422,7 @@ class SpikeDetector:
             ("5m",  features.get("return_5m",  0.0), HARD_FALLBACK_RETURN_5M_PCT),
             ("15m", features.get("return_15m", 0.0), HARD_FALLBACK_RETURN_15M_PCT),
             ("1h",  features.get("return_1h",  0.0), HARD_FALLBACK_RETURN_1H_PCT),
+            ("2h",  features.get("return_2h",  0.0), HARD_FALLBACK_RETURN_2H_PCT),
         ):
             if abs(value) >= hard:
                 direction = "up" if value >= 0 else "down"

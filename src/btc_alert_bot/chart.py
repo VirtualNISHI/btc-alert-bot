@@ -66,6 +66,7 @@ TIMEFRAME_BY_WINDOW: dict[str, tuple[str, int]] = {
     "5m":  ("1m", 120),   # 2h of 1min candles — composite 5m spikes
     "15m": ("5m",  72),   # 6h of 5min candles
     "1h":  ("5m",  72),   # 6h of 5min candles
+    "2h":  ("15m", 48),   # 12h of 15min candles — slow-grind 2h spikes
     "24h": ("15m", 96),   # 24h of 15min candles (legacy, no longer fired)
 }
 DEFAULT_TIMEFRAME = ("5m", 144)  # fallback: 12h × 5min

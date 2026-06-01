@@ -135,10 +135,14 @@ def compute_market_features(snapshot: dict, state: dict | None = None) -> dict:
     # ATR as a percentage of price — comparable across regimes.
     atr_pct = (atr_now / close_now * 100) if close_now > 0 else 0.0
 
-    # Returns on multiple horizons (in 5min-bar units: 3=15m, 12=1h, 288=24h).
+    # Returns on multiple horizons (in 5min-bar units: 3=15m, 12=1h, 24=2h, 288=24h).
     return_5m = compute_returns_pct([*closes, live_close], 1)
     return_15m = compute_returns_pct([*closes, live_close], 3)
     return_1h = compute_returns_pct([*closes, live_close], 12)
+    # 2h horizon catches "slow grind" sell-offs/rallies that never produce
+    # a sharp 1h move but accumulate meaningfully — observed 6/1 BTC moved
+    # -2.86% / 24h with no 1h slope > 0.91%, but 2h max was 1.53%.
+    return_2h = compute_returns_pct([*closes, live_close], 24) if len(closes) >= 24 else 0.0
     return_24h = compute_returns_pct([*closes, live_close], 288) if len(closes) >= 288 else 0.0
 
     # |return_15m| normalized by ATR — "how big is this move vs typical 15m move?".
@@ -174,6 +178,7 @@ def compute_market_features(snapshot: dict, state: dict | None = None) -> dict:
         "return_5m": return_5m,
         "return_15m": return_15m,
         "return_1h": return_1h,
+        "return_2h": return_2h,
         "return_24h": return_24h,
         "move_per_atr": move_per_atr,
         "volume_now": vol_now,
