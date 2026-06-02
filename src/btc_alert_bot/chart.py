@@ -245,12 +245,17 @@ def render_chart(spike: dict, price_data: dict) -> bytes:
     # line. Semi-transparent so it stays subordinate to the headline.
     ticker_kwargs = dict(
         ha="right", va="center",
-        fontsize=12, color="white", alpha=0.9, weight="bold",
+        fontsize=12, color="white", alpha=1.0, weight="bold",
         zorder=2,
     )
     if _CJK_FONT_PROPS is not None:
         ticker_kwargs["fontproperties"] = _CJK_FONT_PROPS
-    fig.text(0.985, 0.922, ticker, **ticker_kwargs)
+    ticker_obj = fig.text(0.985, 0.922, ticker, **ticker_kwargs)
+    # Slightly thicken the glyphs with a thin same-color stroke so the
+    # ticker reads a touch heavier without growing in size.
+    ticker_obj.set_path_effects([
+        _pe.withStroke(linewidth=0.7, foreground="white"),
+    ])
 
     # JST fire-time caption in the chart's bottom-right corner — subtle so
     # it reads as a timestamp watermark, not a data label.
