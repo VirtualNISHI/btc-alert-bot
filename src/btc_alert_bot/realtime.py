@@ -94,7 +94,13 @@ DETECTION_TIMEOUT_S = 120.0
 # for this long, we self-exit so the container's restart policy can heal
 # the process. Docker-compose's healthcheck alone won't restart on
 # unhealthy state with `restart: unless-stopped`.
-WATCHDOG_STALL_S = 1800.0
+#
+# Lowered 1800 → 600s (30min → 10min) after the 2026-06-03 outage: with
+# reliable container DNS (compose `dns:` block) a restart now actually
+# reconnects, so faster self-exit = faster recovery. Healthy operation
+# touches last_activity every ~25-60s (pings + candles), so 10min of
+# total silence unambiguously means a dead connection.
+WATCHDOG_STALL_S = 600.0
 WATCHDOG_POLL_S = 60.0
 
 

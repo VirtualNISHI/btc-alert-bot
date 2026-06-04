@@ -8,6 +8,15 @@ services:
     image: btc-alert-bot:latest
     container_name: btc-alert-bot
     restart: unless-stopped
+    # Resolve via public DNS directly, bypassing the host's
+    # systemd-resolved / AWS VPC resolver. On 2026-06-03 the host VPC
+    # resolver flaked for ~30h ("Temporary failure in name resolution"),
+    # blinding the container the whole time — restarting couldn't help
+    # because the new container inherited the same broken host DNS. Pinning
+    # Cloudflare + Google here makes the container immune to host DNS faults.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     env_file:
       - .env
     volumes:
