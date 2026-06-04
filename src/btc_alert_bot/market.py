@@ -80,6 +80,32 @@ def fetch_klines(bar: str = "5m", limit: int = 200) -> list[dict]:
     return out
 
 
+def fetch_year_low() -> float | None:
+    """Lowest daily LOW since Jan 1 of the current (UTC) year, or None.
+
+    Used to seed the year-to-date-low milestone baseline. Fetches up to
+    300 daily candles (covers >9 months) and takes the min low within the
+    calendar year. Returns None on any failure so callers degrade safely.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        jan1 = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+        candles = fetch_klines(bar="1D", limit=300)
+        lows = []
+        for c in candles:
+            ts = c.get("ts")
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts >= jan1:
+                lows.append(float(c["low"]))
+        return min(lows) if lows else None
+    except Exception as e:
+        log.warning("fetch_year_low failed: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Ticker
 # ---------------------------------------------------------------------------

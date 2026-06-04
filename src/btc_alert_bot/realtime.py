@@ -51,7 +51,12 @@ from .detector import (  # noqa: E402
 )
 from .features import compute_market_features  # noqa: E402
 from .history import find_similar_alerts, record_alert  # noqa: E402
-from .market import fetch_market_snapshot, fetch_window_ohlcv  # noqa: E402
+from .market import (  # noqa: E402
+    fetch_market_snapshot,
+    fetch_window_ohlcv,
+    fetch_year_low,
+)
+from .milestones import ytd_low_badge  # noqa: E402
 from .price import fetch_btc_price  # noqa: E402
 from .publishers import post_discord, post_x  # noqa: E402
 from .summarizer import summarize  # noqa: E402
@@ -372,6 +377,16 @@ class RealtimeBot:
             similar = find_similar_alerts(HISTORY_DB_PATH, spike, limit=3)
             summary = summarize(price_data, spike, factors, similar_alerts=similar)
 
+            # Year-to-date-low milestone: the first time BTC breaks its YTD
+            # low, prepend a one-time badge line (per user "一回目のみ").
+            # Mutates `state`; persisted by the save_state() at path end.
+            ytd_badge = ytd_low_badge(
+                state, price_data["price_usd"], seed_year_low=fetch_year_low
+            )
+            if ytd_badge:
+                summary = f"{ytd_badge}\n{summary}"
+                log.info("YTD-low badge prepended: %s", ytd_badge)
+
             chart_png: bytes | None = None
             try:
                 chart_png = render_chart(spike, price_data)
@@ -459,6 +474,16 @@ class RealtimeBot:
             factors = gather_factors(spike)
             similar = find_similar_alerts(HISTORY_DB_PATH, spike, limit=3)
             summary = summarize(price_data, spike, factors, similar_alerts=similar)
+
+            # Year-to-date-low milestone: the first time BTC breaks its YTD
+            # low, prepend a one-time badge line (per user "一回目のみ").
+            # Mutates `state`; persisted by the save_state() at path end.
+            ytd_badge = ytd_low_badge(
+                state, price_data["price_usd"], seed_year_low=fetch_year_low
+            )
+            if ytd_badge:
+                summary = f"{ytd_badge}\n{summary}"
+                log.info("YTD-low badge prepended: %s", ytd_badge)
 
             chart_png: bytes | None = None
             try:
