@@ -67,6 +67,24 @@ def _format_jst(iso_ts: str | None) -> str:
     except Exception:
         return ""
 
+
+def _format_jst_short(iso_ts: str | None) -> str:
+    """``HH:MM JST`` — compact variant for the X header.
+
+    X weighted-char budget is tight; the date is redundant on a realtime
+    alert (it's implicitly "now"), so we drop it to leave more room for the
+    Japanese body and avoid truncating it.
+    """
+    if not iso_ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_JST).strftime("%H:%M JST")
+    except Exception:
+        return ""
+
 log = logging.getLogger(__name__)
 
 # Twitter weighted-character limit. CJK / kana / hangul characters count
@@ -95,20 +113,47 @@ def x_weighted_length(s: str) -> int:
 
 
 def x_truncate_to_weight(s: str, budget: int) -> str:
-    """Trim ``s`` so its weighted length is <= budget. Adds an ellipsis."""
+    """Trim ``s`` to <= ``budget`` weighted units WITHOUT cutting a Japanese
+    sentence mid-way.
+
+    The old behaviour hard-cut at the exact weight boundary, which chopped
+    the 3rd summary line mid-clause on X ("日本語が切れている"). Instead we
+    take what fits, then back up to the last sentence/line boundary
+    (。！？ or newline) so the tweet ends on a complete thought. Only when
+    no boundary survives in the kept span do we fall back to an ellipsis cut.
+    """
     if x_weighted_length(s) <= budget:
         return s
+    # 1) Greedily keep what fits within the full budget.
     out: list[str] = []
     used = 0
-    # Reserve 1 weighted unit for the trailing ellipsis (… is 1-weight).
-    target = max(0, budget - 1)
     for c in s:
         w = _x_char_weight(c)
-        if used + w > target:
+        if used + w > budget:
             break
         out.append(c)
         used += w
-    return "".join(out) + "…"
+    kept = "".join(out)
+    # 2) Prefer ending at the last sentence-final punctuation / line break.
+    boundary = max(
+        kept.rfind("。"), kept.rfind("！"), kept.rfind("？"), kept.rfind("\n")
+    )
+    if boundary >= 0:
+        clean = kept[: boundary + 1].rstrip("\n")
+        # Accept only if it preserves a meaningful chunk (avoid returning a
+        # stub when the sole boundary sits very early).
+        if x_weighted_length(clean) >= budget * 0.5:
+            return clean
+    # 3) Fallback: hard cut with a trailing ellipsis (… is 1 weighted unit).
+    out2: list[str] = []
+    used2 = 0
+    for c in s:
+        w = _x_char_weight(c)
+        if used2 + w > budget - 1:
+            break
+        out2.append(c)
+        used2 += w
+    return "".join(out2).rstrip("\n") + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +343,9 @@ def post_x(
     header = "🚨 " + _to_bold_ascii("BTC") + f"緊急{event_word}速報{direction_emoji}"
     if move_snippet:
         header = f"{header} {move_snippet}"
-    jst_ts = _format_jst(price_data.get("timestamp"))
+    # Short HH:MM JST (not the full date) on X to leave more weighted
+    # budget for the Japanese body so it isn't truncated mid-sentence.
+    jst_ts = _format_jst_short(price_data.get("timestamp"))
     if jst_ts:
         header = f"{header} ({jst_ts})"
     hashtags = "#BTC #Bitcoin #暗号資産"
