@@ -93,28 +93,48 @@ def ytd_low_badge(
     if price >= ytd_low:
         return ""  # not a new low
 
-    # New running low — always track it, even in Jan/Feb or during cooldown.
-    state["ytd_low"] = price
-
-    # Gate the *badge*: only from March, and at most once per ~month.
-    if now.month < YTD_BADGE_MIN_MONTH:
-        return ""
+    # New running low. Decide whether to BADGE or just silently track.
+    in_cooldown = False
     last = state.get("ytd_low_last_badge")
     if last:
         try:
             last_dt = datetime.fromisoformat(last)
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=timezone.utc)
-            if now - last_dt < timedelta(days=YTD_BADGE_COOLDOWN_DAYS):
-                return ""  # within the 1-month cooldown
+            in_cooldown = now - last_dt < timedelta(days=YTD_BADGE_COOLDOWN_DAYS)
         except Exception:
-            pass
-    state["ytd_low_last_badge"] = now.isoformat()
-    log.info("YTD-low break — badging ($%,.0f, month=%d)", price, now.month)
+            in_cooldown = False
+
+    if now.month < YTD_BADGE_MIN_MONTH or in_cooldown:
+        # Track the running low silently (keeps the year-low reference
+        # accurate) but withhold the badge — Jan/Feb, or within the
+        # 1-month cooldown after a previous badge.
+        state["ytd_low"] = price
+        return ""
+
+    # Qualifies to badge. Deliberately do NOT mutate ytd_low / last_badge
+    # here: the caller commits via mark_ytd_badged() ONLY after a successful
+    # post. So if delivery fails, the next candle re-evaluates (price is
+    # still < ytd_low) and retries — the YTD-low badge is GUARANTEED to
+    # post (絶対投稿), with the normal cooldown ignored.
+    log.info("YTD-low break — badge pending ($%,.0f, month=%d)", price, now.month)
     return f"🔴 年初来最安値を更新（${price:,.0f}）"
 
 
-def forced_ytd_spike(features: dict) -> dict:
+def mark_ytd_badged(state: dict, price_usd: float, *, now: datetime | None = None) -> None:
+    """Commit a successfully-posted YTD-low badge: advance the low + stamp the
+    cooldown anchor. Called by the alert path ONLY after a successful post, so
+    a delivery failure leaves the badge pending and it retries next candle.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        state["ytd_low"] = float(price_usd)
+    except (TypeError, ValueError):
+        pass
+    state["ytd_low_last_badge"] = now.isoformat()
+
+
+def forced_ytd_spike(features: dict, price_data: dict | None = None) -> dict:
     """Synthesize a DOWN spike for a YTD-low override fire.
 
     Used when a first-time year-to-date-low break must fire even though the
@@ -136,6 +156,15 @@ def forced_ytd_spike(features: dict) -> dict:
             continue
         if abs(fv) > abs(change):
             window, change = w, fv
+    # Features empty (REST snapshot failed → legacy path): fall back to the
+    # 1h change from the price feed so the alert still shows a real number.
+    if abs(change) < 0.01 and price_data is not None:
+        ch = price_data.get("change_1h")
+        try:
+            change = float(ch)
+            window = "1h"
+        except (TypeError, ValueError):
+            pass
     return {
         "window": window,
         "change": change,

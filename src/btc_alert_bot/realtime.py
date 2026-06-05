@@ -57,7 +57,11 @@ from .market import (  # noqa: E402
     fetch_window_ohlcv,
     fetch_year_low,
 )
-from .milestones import forced_ytd_spike, ytd_low_badge  # noqa: E402
+from .milestones import (  # noqa: E402
+    forced_ytd_spike,
+    mark_ytd_badged,
+    ytd_low_badge,
+)
 from .price import fetch_btc_price  # noqa: E402
 from .publishers import post_discord, post_x  # noqa: E402
 from .summarizer import summarize  # noqa: E402
@@ -446,6 +450,11 @@ class RealtimeBot:
 
             if d_disc or d_x:
                 record_alert_in_state(state, spike, price_data)
+                # Commit the YTD-low badge ONLY after a successful post, so a
+                # delivery failure leaves it pending and retries next candle
+                # (絶対投稿 — the YTD-low break always gets out).
+                if ytd_badge:
+                    mark_ytd_badged(state, price_data["price_usd"])
             save_state(STATE_PATH, state)
         except Exception:
             log.exception("Fast-track pipeline failed")
@@ -507,7 +516,7 @@ class RealtimeBot:
                 state, price_data["price_usd"], seed_year_low=fetch_year_low
             )
             if ytd_badge and spike is None:
-                spike = forced_ytd_spike(features)
+                spike = forced_ytd_spike(features, price_data)
                 log.info(
                     "YTD-low override: forcing alert through suppression "
                     "(%s %+.2f%%)", spike["window"], spike["change"],
@@ -570,6 +579,11 @@ class RealtimeBot:
 
             if d_disc or d_x:
                 record_alert_in_state(state, spike, price_data)
+                # Commit the YTD-low badge ONLY after a successful post, so a
+                # delivery failure leaves it pending and retries next candle
+                # (絶対投稿 — the YTD-low break always gets out).
+                if ytd_badge:
+                    mark_ytd_badged(state, price_data["price_usd"])
             save_state(STATE_PATH, state)
         except Exception as e:
             # Log but never crash the WS loop — the next candle close gets a fresh try.
