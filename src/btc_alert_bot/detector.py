@@ -79,12 +79,11 @@ HARD_FALLBACK_RETURN_15M_PCT = 2.0
 # composite-gate base for 1h, so both knobs collapse to the same
 # value. Lowered 2.5 → 2.0 alongside.
 HARD_FALLBACK_RETURN_1H_PCT = 2.0
-# 2h "slow grind" detector. Threshold 1.5% is intentionally below
-# 1h@2.0% intensity-wise — it specifically catches accumulating
-# moves that never produce a sharp 1h slope. Empirically, 6/1 BTC
-# moved -2.86%/24h with max 1h slope only 0.91% but 2h max 1.53%;
-# 1.5% threshold catches exactly that band.
-HARD_FALLBACK_RETURN_2H_PCT = 1.5
+# 2h "slow grind" detector. Raised 1.5% → 2.0% to cut alert noise: at
+# 1.5% it was ~half of all fires (21/43), firing every 90-min cooldown on
+# minor 1.5-1.9% moves during trending/choppy markets. 2.0% keeps the
+# genuine multi-hour grinds while dropping the marginal ones.
+HARD_FALLBACK_RETURN_2H_PCT = 2.0
 # 12h "status report" mode — fires once when a meaningful multi-hour
 # trend has unfolded but no shorter window caught the move. The
 # "extended" tier (defined below) gets a 6h cooldown so this fires
@@ -143,7 +142,8 @@ COOLDOWN_OPP_DIR_MIN = 60
 COOLDOWN_BY_TIER_MIN: dict[str, int] = {
     "short": 90,
     "medium": 180,  # 3 hours — discourage 15m back-to-back on same trend
-    "long": 90,
+    "long": 120,    # 2 hours — raised 90→120 to space out 1h/2h fires in
+                    # trending markets (noise-reduction pass 2026-06-07)
     "extended": 360,  # 6 hours — 12h status reports must not spam
 }
 
