@@ -20,6 +20,7 @@ State persisted in ``state.json``:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -32,6 +33,79 @@ YTD_BADGE_MIN_MONTH = 3
 # Minimum gap between YTD-low badges. Suppresses repeats during one
 # downtrend while still allowing a fresh badge for a new low a month later.
 YTD_BADGE_COOLDOWN_DAYS = 30
+
+# Psychological round-number levels (USD). A downward break of one of these
+# force-fires a 緊急暴落 alert (special exception — cooldown ignored, always
+# posted), like the YTD-low. Configurable via env PSYCH_LEVELS (comma list).
+# After a break fires, the level disarms and only re-arms once price recovers
+# PSYCH_REARM_BUFFER_PCT above it — so oscillation right at the level doesn't
+# spam.
+PSYCH_REARM_BUFFER_PCT = 0.5
+
+
+def _psych_levels() -> list[float]:
+    raw = os.getenv("PSYCH_LEVELS", "60000")
+    out: list[float] = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(float(x))
+        except ValueError:
+            continue
+    return out
+
+
+def psych_level_badge(
+    state: dict, price_usd: float, *, levels: list[float] | None = None
+) -> str:
+    """Return a 🚨 badge when price has crossed DOWN through a psychological
+    level (e.g. $60,000), else "".
+
+    Mirrors the YTD-low retry pattern: does NOT disarm here — the caller
+    commits via ``mark_psych_badged()`` only after a successful post, so a
+    delivery failure retries on the next candle (絶対投稿). Re-arms a level
+    only after price recovers PSYCH_REARM_BUFFER_PCT above it.
+    """
+    try:
+        price = float(price_usd)
+    except (TypeError, ValueError):
+        return ""
+    if price <= 0:
+        return ""
+    levels = levels if levels is not None else _psych_levels()
+    armed = state.setdefault("psych_armed", {})
+    broken: float | None = None
+    for lv in levels:
+        key = str(int(lv))
+        if key not in armed:
+            # First sighting: arm if currently at/above the level (so we only
+            # fire on a fresh downward cross, not a level already below us).
+            armed[key] = price >= lv
+        elif price >= lv * (1 + PSYCH_REARM_BUFFER_PCT / 100):
+            armed[key] = True  # clear recovery → re-arm
+        if price < lv and armed.get(key):
+            if broken is None or lv > broken:
+                broken = lv  # report the highest level breached
+    if broken is None:
+        return ""
+    return f"🚨 BTC ${broken:,.0f}割れ — 心理的節目を下抜け"
+
+
+def mark_psych_badged(
+    state: dict, price_usd: float, *, levels: list[float] | None = None
+) -> None:
+    """Disarm every level the price is now below, after a successful post."""
+    try:
+        price = float(price_usd)
+    except (TypeError, ValueError):
+        return
+    levels = levels if levels is not None else _psych_levels()
+    armed = state.setdefault("psych_armed", {})
+    for lv in levels:
+        if price < lv:
+            armed[str(int(lv))] = False
 
 
 def ytd_low_badge(

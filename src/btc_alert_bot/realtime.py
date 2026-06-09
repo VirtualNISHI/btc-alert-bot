@@ -61,7 +61,9 @@ from .market import (  # noqa: E402
 )
 from .milestones import (  # noqa: E402
     forced_ytd_spike,
+    mark_psych_badged,
     mark_ytd_badged,
+    psych_level_badge,
     ytd_low_badge,
 )
 from .price import fetch_btc_price  # noqa: E402
@@ -415,15 +417,18 @@ class RealtimeBot:
             similar = find_similar_alerts(HISTORY_DB_PATH, spike, limit=3)
             summary = summarize(price_data, spike, factors, similar_alerts=similar)
 
-            # Year-to-date-low milestone: the first time BTC breaks its YTD
-            # low, prepend a one-time badge line (per user "一回目のみ").
-            # Mutates `state`; persisted by the save_state() at path end.
+            # Milestone badges (YTD-low + psych-level break). Prepended to the
+            # summary; committed only after a successful post (retry pattern).
             ytd_badge = ytd_low_badge(
                 state, price_data["price_usd"], seed_year_low=fetch_year_low
             )
+            psych_badge = psych_level_badge(state, price_data["price_usd"])
             if ytd_badge:
                 summary = f"{ytd_badge}\n{summary}"
                 log.info("YTD-low badge prepended: %s", ytd_badge)
+            if psych_badge:
+                summary = f"{psych_badge}\n{summary}"
+                log.info("Psych-level badge prepended: %s", psych_badge)
 
             chart_png: bytes | None = None
             try:
@@ -465,11 +470,13 @@ class RealtimeBot:
 
             if d_disc or d_x:
                 record_alert_in_state(state, spike, price_data)
-                # Commit the YTD-low badge ONLY after a successful post, so a
-                # delivery failure leaves it pending and retries next candle
-                # (絶対投稿 — the YTD-low break always gets out).
+                # Commit milestone badges ONLY after a successful post, so a
+                # delivery failure leaves them pending and retries next candle
+                # (絶対投稿 — the YTD-low / psych-level break always gets out).
                 if ytd_badge:
                     mark_ytd_badged(state, price_data["price_usd"])
+                if psych_badge:
+                    mark_psych_badged(state, price_data["price_usd"])
             save_state(STATE_PATH, state)
         except Exception:
             log.exception("Fast-track pipeline failed")
@@ -530,19 +537,27 @@ class RealtimeBot:
             ytd_badge = ytd_low_badge(
                 state, price_data["price_usd"], seed_year_low=fetch_year_low
             )
-            if ytd_badge and spike is None:
+            # Psychological round-number break ($60k etc.) — same special-
+            # exception treatment as the YTD low (force-fire, bypass cooldown
+            # + debounce, retry until delivered).
+            psych_badge = psych_level_badge(state, price_data["price_usd"])
+            milestone = bool(ytd_badge or psych_badge)
+
+            if milestone and spike is None:
                 spike = forced_ytd_spike(features, price_data)
                 log.info(
-                    "YTD-low override: forcing alert through suppression "
-                    "(%s %+.2f%%)", spike["window"], spike["change"],
+                    "Milestone override: forcing alert through suppression "
+                    "(%s %+.2f%%) ytd=%s psych=%s",
+                    spike["window"], spike["change"],
+                    bool(ytd_badge), bool(psych_badge),
                 )
 
             # Global near-duplicate debounce: drop a same-direction alert
             # that lands within minutes of the previous one (any window/tier)
-            # — e.g. 1h firing right after 2h for the same crash. The YTD-low
-            # forced fire (ytd_badge) bypasses this (絶対投稿).
+            # — e.g. 1h firing right after 2h for the same crash. Milestone
+            # fires (YTD-low / psych-level) bypass this (絶対投稿).
             if (
-                spike is not None and not ytd_badge
+                spike is not None and not milestone
                 and is_global_duplicate(
                     state, spike["direction"], spike["change"],
                     price_data.get("timestamp") or _now_iso(),
@@ -570,9 +585,14 @@ class RealtimeBot:
             similar = find_similar_alerts(HISTORY_DB_PATH, spike, limit=3)
             summary = summarize(price_data, spike, factors, similar_alerts=similar)
 
+            # Prepend milestone badges (most prominent first). Psych-level
+            # break above the YTD-low line when both fire on the same candle.
             if ytd_badge:
                 summary = f"{ytd_badge}\n{summary}"
                 log.info("YTD-low badge prepended: %s", ytd_badge)
+            if psych_badge:
+                summary = f"{psych_badge}\n{summary}"
+                log.info("Psych-level badge prepended: %s", psych_badge)
 
             chart_png: bytes | None = None
             try:
@@ -613,11 +633,13 @@ class RealtimeBot:
 
             if d_disc or d_x:
                 record_alert_in_state(state, spike, price_data)
-                # Commit the YTD-low badge ONLY after a successful post, so a
-                # delivery failure leaves it pending and retries next candle
-                # (絶対投稿 — the YTD-low break always gets out).
+                # Commit milestone badges ONLY after a successful post, so a
+                # delivery failure leaves them pending and retries next candle
+                # (絶対投稿 — the YTD-low / psych-level break always gets out).
                 if ytd_badge:
                     mark_ytd_badged(state, price_data["price_usd"])
+                if psych_badge:
+                    mark_psych_badged(state, price_data["price_usd"])
             save_state(STATE_PATH, state)
         except Exception as e:
             # Log but never crash the WS loop — the next candle close gets a fresh try.
