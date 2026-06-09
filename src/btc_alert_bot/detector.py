@@ -162,6 +162,55 @@ COOLDOWN_BY_TIER_MIN: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
+# Global near-duplicate debounce (cross-window / cross-tier)
+# ---------------------------------------------------------------------------
+# The per-tier cooldown + intra-tier rank can still let two windows fire for
+# the SAME move within a minute (e.g. 2h -2.04% at 23:47 then 1h -2.07% at
+# 23:48 — a faster window preempting a slower one in the long tier). This
+# global guard suppresses ANY same-direction alert that lands within
+# GLOBAL_DEBOUNCE_MIN of the previous *delivered* alert, regardless of
+# window/tier, unless the move is a real escalation (much larger).
+GLOBAL_DEBOUNCE_MIN = 15
+# A move this many times larger than the last alert's is treated as a
+# genuine acceleration and allowed through despite the debounce.
+GLOBAL_DEBOUNCE_ESCALATION_X = 1.8
+
+
+def is_global_duplicate(
+    state: dict, direction: str, change_pct: float, now_iso: str
+) -> bool:
+    """True if a same-direction alert fired < GLOBAL_DEBOUNCE_MIN ago (any
+    window/tier), i.e. this would be a near-duplicate of the same event.
+
+    Opposite direction never matches (a reversal is its own news). A move
+    >= GLOBAL_DEBOUNCE_ESCALATION_X the previous alert's magnitude is treated
+    as an escalation and allowed through. Caller must bypass this for the
+    YTD-low forced fire (絶対投稿).
+    """
+    last_t = state.get("last_alert_time")
+    last_dir = state.get("last_alert_direction")
+    if not last_t or last_dir != direction:
+        return False
+    try:
+        now = datetime.fromisoformat(now_iso)
+        last = datetime.fromisoformat(last_t)
+    except Exception:
+        return False
+    elapsed = (now - last).total_seconds() / 60
+    if elapsed < 0 or elapsed >= GLOBAL_DEBOUNCE_MIN:
+        return False
+    # Escalation override — a much bigger move is a fresh, louder event.
+    try:
+        last_change = abs(float(state.get("last_spike_change") or 0.0))
+        cur_change = abs(float(change_pct))
+        if last_change > 0 and cur_change >= last_change * GLOBAL_DEBOUNCE_ESCALATION_X:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Timeframe tiers — controls how alerts of different windows suppress each
 # other. Per the user's design:
 #   short    (1m/3m/5m) : primary spike detection band

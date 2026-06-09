@@ -43,9 +43,11 @@ load_dotenv()
 from .analyzers import gather_factors  # noqa: E402
 from .chart import render_chart  # noqa: E402
 from .detector import (  # noqa: E402
+    GLOBAL_DEBOUNCE_MIN,
     SpikeDetector,
     append_feature_history,
     is_counter_trend_bounce,
+    is_global_duplicate,
     load_state,
     record_alert_in_state,
     save_state,
@@ -396,6 +398,19 @@ class RealtimeBot:
                 )
                 return
 
+            # Global near-duplicate debounce: don't fire a same-direction
+            # fast-track right after another recent alert (any window/tier).
+            if is_global_duplicate(
+                state, direction, intra_pct,
+                price_data.get("timestamp") or _now_iso(),
+            ):
+                log.info(
+                    "Fast-track %s %+.3f%% (%s) suppressed: global near-"
+                    "duplicate (same-dir alert <%dmin ago)",
+                    window, intra_pct, direction, GLOBAL_DEBOUNCE_MIN,
+                )
+                return
+
             factors = gather_factors(spike)
             similar = find_similar_alerts(HISTORY_DB_PATH, spike, limit=3)
             summary = summarize(price_data, spike, factors, similar_alerts=similar)
@@ -521,6 +536,25 @@ class RealtimeBot:
                     "YTD-low override: forcing alert through suppression "
                     "(%s %+.2f%%)", spike["window"], spike["change"],
                 )
+
+            # Global near-duplicate debounce: drop a same-direction alert
+            # that lands within minutes of the previous one (any window/tier)
+            # — e.g. 1h firing right after 2h for the same crash. The YTD-low
+            # forced fire (ytd_badge) bypasses this (絶対投稿).
+            if (
+                spike is not None and not ytd_badge
+                and is_global_duplicate(
+                    state, spike["direction"], spike["change"],
+                    price_data.get("timestamp") or _now_iso(),
+                )
+            ):
+                log.info(
+                    "Composite %s %+.2f%% (%s) suppressed: global near-"
+                    "duplicate (same-dir alert <%dmin ago)",
+                    spike["window"], spike["change"], spike["direction"],
+                    GLOBAL_DEBOUNCE_MIN,
+                )
+                spike = None
 
             if spike is None:
                 save_state(STATE_PATH, state)
