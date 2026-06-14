@@ -27,7 +27,6 @@ from .fred import fetch_macro_background
 from .grok_search import fetch_grok_x_search
 from .whale_monitor import fetch_whale_alerts
 from .x_list_monitor import fetch_x_list_signals
-from .x_monitor import fetch_x_monitor
 
 log = logging.getLogger(__name__)
 
@@ -359,7 +358,10 @@ def gather_factors(spike: dict | None = None) -> list[dict]:
         # Macro / social context
         fetch_macro_background,
         fetch_reddit_signal,
-        fetch_x_monitor,
+        # Nitter (fetch_x_monitor) retired 2026-06-14: public instances are
+        # chronically dead (circuit breaker permanently open). X coverage now
+        # comes solely from the Grok-backed fetchers below — x_search_grok /
+        # whale / x_list. See grok_search.py. NITTER_* env vars are now no-ops.
     ]
     # Grok-backed fetchers all share the same /v1/responses + x_search
     # transport; running them in parallel just multiplies the wall-time
