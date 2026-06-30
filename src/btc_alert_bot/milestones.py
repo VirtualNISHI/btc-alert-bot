@@ -129,7 +129,17 @@ def ytd_low_badge(
     - New running low: always tracked. The badge text is returned only when
       ``now.month >= YTD_BADGE_MIN_MONTH`` AND at least
       ``YTD_BADGE_COOLDOWN_DAYS`` have passed since the last badge.
+    - One-shot mode (``YTD_ONESHOT=true``): once the YTD-low emergency has
+      fired and been delivered once, never badge again (the running low is
+      still tracked). Re-arm by clearing ``ytd_emergency_fired`` in
+      state.json or unsetting the env. Default off → recurring behavior.
     """
+    # One-shot latch (user opt-in "今回限り"): suppress the badge for good
+    # once it has fired. Checked first so it short-circuits all other work.
+    if os.getenv("YTD_ONESHOT", "false").lower() == "true" and state.get(
+        "ytd_emergency_fired"
+    ):
+        return ""
     try:
         price = float(price_usd)
     except (TypeError, ValueError):
@@ -206,6 +216,10 @@ def mark_ytd_badged(state: dict, price_usd: float, *, now: datetime | None = Non
     except (TypeError, ValueError):
         pass
     state["ytd_low_last_badge"] = now.isoformat()
+    # Latch the one-shot emergency (only consulted when YTD_ONESHOT=true, so
+    # this is a harmless no-op in the default recurring mode).
+    if os.getenv("YTD_ONESHOT", "false").lower() == "true":
+        state["ytd_emergency_fired"] = True
 
 
 def forced_ytd_spike(features: dict, price_data: dict | None = None) -> dict:

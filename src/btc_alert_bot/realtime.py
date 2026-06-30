@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from . import event_mode  # noqa: E402
 from .analyzers import gather_factors  # noqa: E402
 from .chart import render_chart  # noqa: E402
 from .detector import (  # noqa: E402
@@ -134,6 +135,7 @@ class RealtimeBot:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        log.info("%s", event_mode.describe())
         watchdog_task = asyncio.create_task(self._watchdog())
         try:
             delay = RECONNECT_INITIAL_DELAY
@@ -271,6 +273,9 @@ class RealtimeBot:
             else FAST_TRACK_RETURN_3M_PCT
         )
         window = "1m" if channel == "candle1m" else "3m"
+        # Event-mode (e.g. FOMC window) lowers the fast-track floor; the
+        # factor is 1.0 outside any configured window → unchanged normally.
+        threshold *= event_mode.threshold_factor(_now_iso())
 
         # Fast-track wins if the intra-bar move clearly crossed its floor.
         if abs(intra_pct) >= threshold:
@@ -357,7 +362,7 @@ class RealtimeBot:
                 FAST_TRACK_RETURN_1M_PCT
                 if window == "1m"
                 else FAST_TRACK_RETURN_3M_PCT
-            )
+            ) * event_mode.threshold_factor(_now_iso())
             spike = {
                 "window": window,
                 "change": intra_pct,
@@ -390,6 +395,7 @@ class RealtimeBot:
                 direction, intra_pct,
                 price_data.get("change_1h", 0.0),
                 price_data.get("change_24h", 0.0),
+                override_mult=event_mode.threshold_factor(_now_iso()),
             ):
                 log.info(
                     "Fast-track %s %+.3f%% suppressed: counter-trend bounce "
@@ -444,6 +450,16 @@ class RealtimeBot:
 
             dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
             enable_x = os.getenv("ENABLE_X_POST", "false").lower() == "true"
+            # The 年初来最安値 (YTD-low) emergency bulletin reaches X even when
+            # routine X posting is off, so the once-only crash bulletin gets
+            # out. Needs X API keys; opt-in via ENABLE_X_YTD_LOW. Scoped to the
+            # YTD-low badge ONLY — psych-level ($60k) breaks are NOT auto-
+            # tweeted (they recur far more often, with no one-shot cap).
+            # Routine spikes still obey ENABLE_X_POST.
+            force_x = (
+                os.getenv("ENABLE_X_YTD_LOW", "false").lower() == "true"
+                and bool(ytd_badge)
+            )
             d_disc = d_x = False
             if dry_run:
                 log.info("[DRY_RUN] Skipping actual posts")
@@ -453,7 +469,7 @@ class RealtimeBot:
                     summary, price_data, spike,
                     chart_png=chart_png, window_ohlcv=window_ohlcv,
                 )
-                if enable_x:
+                if enable_x or force_x:
                     d_x = post_x(
                         summary, price_data, spike, chart_png=chart_png
                     )
@@ -470,13 +486,16 @@ class RealtimeBot:
 
             if d_disc or d_x:
                 record_alert_in_state(state, spike, price_data)
-                # Commit milestone badges ONLY after a successful post, so a
-                # delivery failure leaves them pending and retries next candle
-                # (絶対投稿 — the YTD-low / psych-level break always gets out).
-                if ytd_badge:
-                    mark_ytd_badged(state, price_data["price_usd"])
-                if psych_badge:
-                    mark_psych_badged(state, price_data["price_usd"])
+                # Commit milestone badges ONLY after a successful REAL post, so
+                # a delivery failure leaves them pending and retries next candle
+                # (絶対投稿 — the YTD-low break always gets out). Skipped under
+                # DRY_RUN so a dry validation pass can't burn the YTD_ONESHOT
+                # latch (which would suppress the next real break).
+                if not dry_run:
+                    if ytd_badge:
+                        mark_ytd_badged(state, price_data["price_usd"])
+                    if psych_badge:
+                        mark_psych_badged(state, price_data["price_usd"])
             save_state(STATE_PATH, state)
         except Exception:
             log.exception("Fast-track pipeline failed")
@@ -518,6 +537,9 @@ class RealtimeBot:
                 spike["direction"], spike["change"],
                 (features or {}).get("return_1h", price_data.get("change_1h", 0.0)),
                 price_data.get("change_24h", 0.0),
+                override_mult=event_mode.threshold_factor(
+                    price_data.get("timestamp")
+                ),
             ):
                 log.info(
                     "Composite %s %+.2f%% (%s) suppressed: counter-trend "
@@ -607,6 +629,14 @@ class RealtimeBot:
 
             dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
             enable_x = os.getenv("ENABLE_X_POST", "false").lower() == "true"
+            # The 年初来最安値 (YTD-low) emergency bulletin reaches X even when
+            # routine X posting is off (opt-in ENABLE_X_YTD_LOW; needs X API
+            # keys). Scoped to the YTD-low badge ONLY — psych-level breaks are
+            # not auto-tweeted. Routine spikes still obey ENABLE_X_POST.
+            force_x = (
+                os.getenv("ENABLE_X_YTD_LOW", "false").lower() == "true"
+                and bool(ytd_badge)
+            )
             d_disc = d_x = False
             if dry_run:
                 log.info("[DRY_RUN] Skipping actual posts")
@@ -616,7 +646,7 @@ class RealtimeBot:
                     summary, price_data, spike,
                     chart_png=chart_png, window_ohlcv=window_ohlcv,
                 )
-                if enable_x:
+                if enable_x or force_x:
                     d_x = post_x(
                         summary, price_data, spike, chart_png=chart_png
                     )
@@ -633,13 +663,16 @@ class RealtimeBot:
 
             if d_disc or d_x:
                 record_alert_in_state(state, spike, price_data)
-                # Commit milestone badges ONLY after a successful post, so a
-                # delivery failure leaves them pending and retries next candle
-                # (絶対投稿 — the YTD-low / psych-level break always gets out).
-                if ytd_badge:
-                    mark_ytd_badged(state, price_data["price_usd"])
-                if psych_badge:
-                    mark_psych_badged(state, price_data["price_usd"])
+                # Commit milestone badges ONLY after a successful REAL post, so
+                # a delivery failure leaves them pending and retries next candle
+                # (絶対投稿 — the YTD-low break always gets out). Skipped under
+                # DRY_RUN so a dry validation pass can't burn the YTD_ONESHOT
+                # latch (which would suppress the next real break).
+                if not dry_run:
+                    if ytd_badge:
+                        mark_ytd_badged(state, price_data["price_usd"])
+                    if psych_badge:
+                        mark_psych_badged(state, price_data["price_usd"])
             save_state(STATE_PATH, state)
         except Exception as e:
             # Log but never crash the WS loop — the next candle close gets a fresh try.

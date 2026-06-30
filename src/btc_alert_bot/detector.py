@@ -19,6 +19,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from . import event_mode
 from .features import (
     HIST_LOOKBACK_BARS,
     adaptive_return_floor,
@@ -113,6 +114,8 @@ def is_counter_trend_bounce(
     move_pct: float,
     trend_1h_pct: float,
     trend_24h_pct: float = 0.0,
+    *,
+    override_mult: float = 1.0,
 ) -> bool:
     """True if ``direction`` is a minor bounce against an established trend.
 
@@ -122,6 +125,12 @@ def is_counter_trend_bounce(
       already flipped to the move's direction (reversal momentum present,
       not a dead-cat tick).
     Symmetric: up-reversal in a downtrend AND down-reversal in an uptrend.
+
+    ``override_mult`` (≤1.0) scales BOTH override thresholds in lock-step
+    with the event-mode fire floors. Without it, a window that drops the
+    fire floor to e.g. 0.36% would still have its reversals re-suppressed
+    by the fixed 1.5% override — defeating the lowered floor right when a
+    sharp reversal (the FOMC pattern) matters most.
     """
     try:
         move = abs(float(move_pct))
@@ -129,18 +138,20 @@ def is_counter_trend_bounce(
         t24 = float(trend_24h_pct)
     except (TypeError, ValueError):
         return False
-    if move >= COUNTER_TREND_OVERRIDE_PCT:
+    override = COUNTER_TREND_OVERRIDE_PCT * override_mult
+    momentum_override = COUNTER_TREND_MOMENTUM_OVERRIDE_PCT * override_mult
+    if move >= override:
         return False  # big enough to be a genuine reversal
     downtrend = t1h <= -COUNTER_TREND_1H_PCT or t24 <= -COUNTER_TREND_24H_PCT
     uptrend = t1h >= COUNTER_TREND_1H_PCT or t24 >= COUNTER_TREND_24H_PCT
     if direction == "up" and downtrend:
         # 1h already positive (reversal underway) + clears momentum override
         # → fire early; otherwise it's a dead-cat bounce → suppress.
-        if t1h > 0 and move >= COUNTER_TREND_MOMENTUM_OVERRIDE_PCT:
+        if t1h > 0 and move >= momentum_override:
             return False
         return True
     if direction == "down" and uptrend:
-        if t1h < 0 and move >= COUNTER_TREND_MOMENTUM_OVERRIDE_PCT:
+        if t1h < 0 and move >= momentum_override:
             return False
         return True
     return False
@@ -197,7 +208,10 @@ def is_global_duplicate(
     except Exception:
         return False
     elapsed = (now - last).total_seconds() / 60
-    if elapsed < 0 or elapsed >= GLOBAL_DEBOUNCE_MIN:
+    # Event-mode shortens the debounce window (cooldown_factor == 1.0 when
+    # no event window is active → unchanged in normal operation).
+    debounce_min = GLOBAL_DEBOUNCE_MIN * event_mode.cooldown_factor(now_iso)
+    if elapsed < 0 or elapsed >= debounce_min:
         return False
     # Escalation override — a much bigger move is a fresh, louder event.
     try:
@@ -342,7 +356,10 @@ class SpikeDetector:
         the 1h horizon (24h alerts were removed at the user's request).
         """
         ch_1h = price_data["change_1h"]
-        if abs(ch_1h) < THRESHOLD_1H_PCT:
+        thr_1h = THRESHOLD_1H_PCT * event_mode.threshold_factor(
+            price_data.get("timestamp")
+        )
+        if abs(ch_1h) < thr_1h:
             return None
         spike = {
             "window": "1h",
@@ -350,7 +367,7 @@ class SpikeDetector:
             "direction": "up" if ch_1h > 0 else "down",
             "score": None,
             "reasons": [
-                f"1h move {ch_1h:+.2f}% over ±{THRESHOLD_1H_PCT}% (legacy)"
+                f"1h move {ch_1h:+.2f}% over ±{thr_1h:.2f}% (legacy)"
             ],
             "features": None,
         }
@@ -377,6 +394,16 @@ class SpikeDetector:
             return self._hard_fallback_only(features, price_data)
 
         direction_cd = self._cooldown_direction(price_data["timestamp"])
+
+        # Event-mode (e.g. an FOMC window) temporarily lowers every fire
+        # threshold by this factor. tf == 1.0 unless a configured window is
+        # active, so normal operation is completely unchanged.
+        tf = event_mode.threshold_factor(price_data["timestamp"])
+        if tf != 1.0:
+            log.info(
+                "Event-mode ACTIVE (%s): fire thresholds ×%.2f",
+                event_mode.active_window_label(price_data["timestamp"]), tf,
+            )
 
         # --- 1. Per-feature robust z-scores ---
         atr_z = clipped_z(features["atr_pct"], history_field(history, "atr_pct"), 0, 4)
@@ -417,22 +444,22 @@ class SpikeDetector:
         # --- 3. Hard fallback first (catches obvious moves regardless of score).
         #        We probe in tier-priority order: short windows first, then
         #        medium, then long. 24h+ are intentionally not considered.
-        if abs(return_5m) >= HARD_FALLBACK_RETURN_5M_PCT:
+        if abs(return_5m) >= HARD_FALLBACK_RETURN_5M_PCT * tf:
             fired_window = "5m"
             fired_change = return_5m
             fired_direction = "up" if return_5m >= 0 else "down"
             reasons.append(f"5m move {return_5m:+.2f}% over hard floor")
-        elif abs(return_15m) >= HARD_FALLBACK_RETURN_15M_PCT:
+        elif abs(return_15m) >= HARD_FALLBACK_RETURN_15M_PCT * tf:
             fired_window = "15m"
             fired_change = return_15m
             fired_direction = "up" if return_15m >= 0 else "down"
             reasons.append(f"15m move {return_15m:+.2f}% over hard floor")
-        elif abs(features["return_1h"]) >= HARD_FALLBACK_RETURN_1H_PCT:
+        elif abs(features["return_1h"]) >= HARD_FALLBACK_RETURN_1H_PCT * tf:
             fired_window = "1h"
             fired_change = features["return_1h"]
             fired_direction = "up" if features["return_1h"] >= 0 else "down"
             reasons.append(f"1h move {fired_change:+.2f}% over hard floor")
-        elif abs(features.get("return_2h", 0.0)) >= HARD_FALLBACK_RETURN_2H_PCT:
+        elif abs(features.get("return_2h", 0.0)) >= HARD_FALLBACK_RETURN_2H_PCT * tf:
             # 2h slow-grind catch — probed AFTER 1h so a sharp move fires
             # as "1h" first; only fires as "2h" when the move was too
             # gradual to trip the 1h floor.
@@ -440,7 +467,7 @@ class SpikeDetector:
             fired_change = features["return_2h"]
             fired_direction = "up" if features["return_2h"] >= 0 else "down"
             reasons.append(f"2h move {fired_change:+.2f}% over slow-grind floor")
-        elif abs(features.get("return_12h", 0.0)) >= HARD_FALLBACK_RETURN_12H_PCT:
+        elif abs(features.get("return_12h", 0.0)) >= HARD_FALLBACK_RETURN_12H_PCT * tf:
             # 12h "status report" — last resort, fires only when none of
             # the shorter windows did but a multi-hour drift accumulated
             # past 3%. Suppressed by recent same-direction long-tier
@@ -455,16 +482,20 @@ class SpikeDetector:
         # confirmation timeframe — fires only on sustained moves so it
         # doesn't replay a 5m alert as a separate "15m" alert 10min later.
         adaptive_floor_5m = adaptive_return_floor(
-            history, FIRE_RETURN_5M_MIN_PCT,
+            history, FIRE_RETURN_5M_MIN_PCT * tf,
             reference_pct=ADAPTIVE_REF_ATR_PCT_5M,
         )
         adaptive_floor_15m = adaptive_return_floor(
-            history, FIRE_RETURN_15M_MIN_PCT,
+            history, FIRE_RETURN_15M_MIN_PCT * tf,
             reference_pct=ADAPTIVE_REF_ATR_PCT_15M,
         )
 
+        # NOTE: only the score floor is event-scaled. The z-score confirm
+        # (atr_z / vol_z) is the anti-fakeout gate and is left UNSCALED on
+        # purpose — loosening it during FOMC chop would invite false spikes,
+        # and z-scores already shrink against an elevated-volatility baseline.
         passes_score_and_confirm = (
-            score >= FIRE_SCORE_MIN
+            score >= FIRE_SCORE_MIN * tf
             and (atr_z >= FIRE_ATR_Z_MIN or vol_z >= FIRE_VOL_Z_MIN)
         )
 
@@ -541,6 +572,7 @@ class SpikeDetector:
         first (5m), then medium (15m), then long (1h). Anything longer
         than 1h was removed at the user's request.
         """
+        tf = event_mode.threshold_factor(price_data.get("timestamp"))
         for window, value, hard in (
             ("5m",  features.get("return_5m",  0.0), HARD_FALLBACK_RETURN_5M_PCT),
             ("15m", features.get("return_15m", 0.0), HARD_FALLBACK_RETURN_15M_PCT),
@@ -548,7 +580,7 @@ class SpikeDetector:
             ("2h",  features.get("return_2h",  0.0), HARD_FALLBACK_RETURN_2H_PCT),
             ("12h", features.get("return_12h", 0.0), HARD_FALLBACK_RETURN_12H_PCT),
         ):
-            if abs(value) >= hard:
+            if abs(value) >= hard * tf:
                 direction = "up" if value >= 0 else "down"
                 if self._is_suppressed(window, direction, price_data["timestamp"]):
                     return None
@@ -655,8 +687,17 @@ class SpikeDetector:
         except Exception:
             return False
 
+        # Event-mode shortens cooldowns (factors == 1.0 when no window is
+        # active → unchanged in normal operation). The reversal (opposite-
+        # direction) cooldown gets its OWN, far more aggressive factor so the
+        # sharp FOMC reversal leg — which lands minutes after the first
+        # spike — isn't swallowed by the normal 60-min reversal cooldown.
+        cf = event_mode.cooldown_factor(now_iso)
         same_dir_cooldown = COOLDOWN_BY_TIER_MIN.get(
             spike_tier, COOLDOWN_SAME_DIR_MIN
+        ) * cf
+        opp_dir_cooldown = COOLDOWN_OPP_DIR_MIN * event_mode.opp_dir_cooldown_factor(
+            now_iso
         )
 
         # 1) Same-tier cooldown — with INTRA-TIER hierarchy. Within the
@@ -678,7 +719,7 @@ class SpikeDetector:
                 if last_rank is None or cur_rank >= last_rank:
                     log.info(
                         "Suppressed: %s tier same-direction cooldown "
-                        "(%.1f / %d min, last=%s, cur=%s rank=%d)",
+                        "(%.1f / %.0f min, last=%s, cur=%s rank=%d)",
                         spike_tier, elapsed, same_dir_cooldown,
                         last_window, window, cur_rank,
                     )
@@ -689,10 +730,10 @@ class SpikeDetector:
                     "(rank %d < %d, %.1f min ago)",
                     window, last_window, cur_rank, last_rank, elapsed,
                 )
-            elif last_dir != direction and elapsed < COOLDOWN_OPP_DIR_MIN:
+            elif last_dir != direction and elapsed < opp_dir_cooldown:
                 log.info(
-                    "Suppressed: %s tier reversal cooldown (%.1f / %d min)",
-                    spike_tier, elapsed, COOLDOWN_OPP_DIR_MIN,
+                    "Suppressed: %s tier reversal cooldown (%.1f / %.0f min)",
+                    spike_tier, elapsed, opp_dir_cooldown,
                 )
                 return True
 
